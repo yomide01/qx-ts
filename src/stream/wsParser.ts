@@ -1,4 +1,5 @@
 import { Tick, AssetPayout, AccountBalance, TradeDeal } from './types.js';
+import { normalizeAsset } from './assets.js';
 
 export interface ParsedWsMessage {
   eventName: string;
@@ -124,7 +125,7 @@ export class QxWsParser {
     if (Array.isArray(data) && data.length > 0) {
       const first = data[0];
       if (Array.isArray(first) && first.length >= 3) {
-        const asset = String(first[0]).toUpperCase().replace(/\//g, '');
+        const asset = normalizeAsset(first[0]);
         let time = Number(first[1]);
         // Convert seconds to ms if needed
         if (time < 1e11) time = Math.round(time * 1000);
@@ -138,7 +139,7 @@ export class QxWsParser {
 
     // Pattern 2: Object format { asset, price, time }
     if (data.asset && data.price !== undefined) {
-      const asset = String(data.asset).toUpperCase().replace(/\//g, '');
+      const asset = normalizeAsset(data.asset);
       const price = Number(data.price);
       let time = Number(data.time ?? Date.now());
       if (time < 1e11) time = Math.round(time * 1000);
@@ -147,7 +148,7 @@ export class QxWsParser {
 
     // Pattern 3: { symbol, rate }
     if (data.symbol && (data.rate !== undefined || data.close !== undefined)) {
-      const asset = String(data.symbol).toUpperCase().replace(/\//g, '');
+      const asset = normalizeAsset(data.symbol);
       const price = Number(data.rate ?? data.close);
       let time = Number(data.time ?? Date.now());
       if (time < 1e11) time = Math.round(time * 1000);
@@ -164,7 +165,7 @@ export class QxWsParser {
   public extractHistory(eventName: string, data: any): { asset: string; period: number; ticks: Tick[] } | null {
     if (!data || typeof data !== 'object') return null;
     if (data.history && Array.isArray(data.history) && data.asset) {
-      const asset = String(data.asset).toUpperCase().replace(/\//g, '');
+      const asset = normalizeAsset(data.asset);
       const period = Number(data.period || 300);
       const ticks: Tick[] = [];
 
@@ -206,7 +207,7 @@ export class QxWsParser {
 
           if (rawSymbol && !isNaN(payoutVal) && payoutVal > 0) {
             const isOtc = rawSymbol.toLowerCase().includes('otc') || rawName.toLowerCase().includes('otc');
-            const cleanAsset = rawSymbol.toUpperCase().replace(/\//g, '');
+            const cleanAsset = normalizeAsset(rawSymbol);
 
             payouts.push({
               asset: cleanAsset,
@@ -227,7 +228,7 @@ export class QxWsParser {
             const name = String(item.name || asset);
             const isOtc = name.toLowerCase().includes('otc') || Boolean(item.is_otc);
             payouts.push({
-              asset: String(asset).toUpperCase().replace(/\//g, ''),
+              asset: normalizeAsset(asset),
               name,
               payoutPercent: payout > 1 ? payout : payout * 100,
               isOtc,
@@ -248,13 +249,30 @@ export class QxWsParser {
     if (!data || typeof data !== 'object') return null;
 
     if (data.live_balance !== undefined || data.demo_balance !== undefined || data.balance !== undefined) {
-      const isDemo = Boolean(data.isDemo ?? data.is_demo ?? true);
-      const balance = Number(isDemo ? (data.demo_balance ?? data.balance ?? 0) : (data.live_balance ?? data.balance ?? 0));
+      // Only trust an explicit flag. Guessing "demo" when the flag is missing is what made
+      // the bot think a live account was a demo account.
+      const flag = QxWsParser.readDemoFlag(data);
+      if (flag === null) return null;
+      const balance = Number(flag ? (data.demo_balance ?? data.balance ?? 0) : (data.live_balance ?? data.balance ?? 0));
       return {
         balance,
         currency: String(data.currency || 'USD'),
-        isDemo,
+        isDemo: flag,
       };
+    }
+    return null;
+  }
+
+  /** Reads a demo/live marker from a Quotex payload. Returns null when there is none. */
+  public static readDemoFlag(data: any): boolean | null {
+    if (!data || typeof data !== 'object') return null;
+    for (const key of ['isDemo', 'is_demo', 'demo']) {
+      if (data[key] !== undefined && data[key] !== null) return Boolean(Number(data[key]) || data[key] === true || data[key] === 'true');
+    }
+    const mode = data.account_type ?? data.accountType ?? data.mode ?? data.type;
+    if (typeof mode === 'string') {
+      if (/demo|practice/i.test(mode)) return true;
+      if (/live|real/i.test(mode)) return false;
     }
     return null;
   }
@@ -273,7 +291,7 @@ export class QxWsParser {
 
     return {
       id,
-      asset: asset.toUpperCase().replace(/\//g, ''),
+      asset: normalizeAsset(asset),
       direction: direction === 'call' || direction === 'up' || direction === '1' ? 'call' : 'put',
       amount: Number(data.amount ?? data.open_cost ?? 0),
       openTime: Number(data.open_time ?? data.openTime ?? Date.now()),
@@ -281,6 +299,7 @@ export class QxWsParser {
       openPrice: Number(data.open_price ?? data.openPrice ?? 0),
       closePrice: data.close_price !== undefined ? Number(data.close_price) : undefined,
       profit: data.profit !== undefined ? Number(data.profit) : undefined,
+      isDemo: QxWsParser.readDemoFlag(data) ?? undefined,
       status: data.close_time ? (Number(data.profit) > 0 ? 'won' : Number(data.profit) < 0 ? 'lost' : 'draw') : 'open',
     };
   }

@@ -30,7 +30,6 @@ async function main() {
 
   const { context, page } = await launchBrowserSession(async (p) => {
     // Hook BEFORE navigation to catch everything
-    const { Page: CDPPage } = await import('playwright');
 
     // Playwright native WS frames
     p.on('websocket', (ws) => {

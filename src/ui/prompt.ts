@@ -1,6 +1,7 @@
 import readline from 'readline';
 import { TradingSignal } from '../analysis/signalEngine.js';
 import { playAlertSound } from './sound.js';
+import { AccountMode } from '../stream/types.js';
 
 export interface PromptDecision {
   confirmed: boolean;
@@ -13,7 +14,7 @@ export class SignalPromptUI {
   /**
    * Displays an interactive countdown prompt for a detected trading signal.
    */
-  public async promptUser(signal: TradingSignal): Promise<PromptDecision> {
+  public async promptUser(signal: TradingSignal, accountMode: AccountMode = 'UNKNOWN'): Promise<PromptDecision> {
     if (this.activePrompt) {
       console.log(`[Prompt] An active prompt is already awaiting decision. Skipping secondary alert for ${signal.asset}.`);
       return { confirmed: false, signal };
@@ -31,7 +32,7 @@ export class SignalPromptUI {
 
     console.log('\n');
     console.log(`${cyan}╔════════════════════════════════════════════════════════════════════╗${resetColor}`);
-    console.log(`${cyan}║${bold}                  HIGH-PROBABILITY SIGNAL DETECTED                  ${cyan}║${resetColor}`);
+    console.log(`${cyan}║${bold}                  SETUP DETECTED (not a guaranteed win)            ${cyan}║${resetColor}`);
     console.log(`${cyan}╠════════════════════════════════════════════════════════════════════╣${resetColor}`);
     console.log(`${cyan}║${resetColor} Asset      : ${bold}${signal.asset.padEnd(16)}${resetColor} (${signal.isOtc ? 'OTC' : 'Live'}) ${' '.repeat(34)} ${cyan}║${resetColor}`);
     console.log(
@@ -44,9 +45,12 @@ export class SignalPromptUI {
         signal.expiryTime
       ).toLocaleTimeString()}) ${' '.repeat(24)}${cyan}║${resetColor}`
     );
+    const accountLabel =
+      accountMode === 'LIVE' ? '\x1b[41m\x1b[97m LIVE - REAL MONEY \x1b[0m' : accountMode === 'DEMO' ? 'DEMO' : 'UNKNOWN (check Quotex!)';
     console.log(
-      `${cyan}║${resetColor} Win Chance : ${bold}${signal.confidence}%${resetColor} | Payout: ${bold}${signal.payoutPercent}%${resetColor} ${' '.repeat(32)}${cyan}║${resetColor}`
+      `${cyan}║${resetColor} Setup score: ${bold}${signal.confidence}${resetColor} (rule score, NOT a win probability) | Payout: ${bold}${signal.payoutPercent}%${resetColor}`
     );
+    console.log(`${cyan}║${resetColor} Account    : ${accountLabel}`);
     console.log(`${cyan}║${resetColor} Regime     : ${signal.marketRegime.padEnd(53)}${cyan}║${resetColor}`);
     console.log(`${cyan}╠════════════════════════════════════════════════════════════════════╣${resetColor}`);
     console.log(`${cyan}║${resetColor} Confluence Reasons: ${' '.repeat(45)}${cyan}║${resetColor}`);

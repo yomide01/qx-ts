@@ -11,7 +11,9 @@
     "debug:ws": "tsx src/stream/wsDebugger.ts",
     "journal:report": "tsx src/journal/report.ts",
     "prompt:test": "tsx src/testDryRun.ts",
-    "test": "tsx src/systemDiagnostics.ts"
+    "test": "tsx src/systemDiagnostics.ts",
+    "debug:dom": "tsx src/stream/domProbe.ts",
+    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/stream/account.test.ts"
   },
   "keywords": [],
   "author": "",
