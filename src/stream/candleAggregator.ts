@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { Tick, Candle } from './types.js';
 import { QxWsSniffer } from './wsSniffer.js';
+import { normalizeAsset } from './assets.js';
 
 export interface CandleEvents {
   candleUpdate: (candle: Candle) => void;
@@ -82,7 +83,7 @@ export class CandleAggregator extends EventEmitter {
    */
   public seedHistory(asset: string, ticks: Tick[]): void {
     if (!ticks || ticks.length === 0) return;
-    const cleanAsset = asset.toUpperCase().replace(/\//g, '');
+    const cleanAsset = normalizeAsset(asset);
 
     // Sort ticks chronologically
     const sorted = [...ticks].sort((a, b) => a.time - b.time);
@@ -133,7 +134,7 @@ export class CandleAggregator extends EventEmitter {
    * Returns closed candles for an asset and timeframe (chronological order)
    */
   public getHistory(asset: string, timeframeSeconds: number): Candle[] {
-    const key = `${asset.toUpperCase()}_${timeframeSeconds}`;
+    const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
     return this.candleHistory.get(key) || [];
   }
 
@@ -141,7 +142,7 @@ export class CandleAggregator extends EventEmitter {
    * Returns the currently active (forming) candle
    */
   public getCurrentCandle(asset: string, timeframeSeconds: number): Candle | undefined {
-    const key = `${asset.toUpperCase()}_${timeframeSeconds}`;
+    const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
     return this.activeCandles.get(key);
   }
 }

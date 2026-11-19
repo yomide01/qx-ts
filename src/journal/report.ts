@@ -1,5 +1,6 @@
 import { TradingJournalDB } from './database.js';
 import { JournalAnalytics } from './analytics.js';
+import { edgeVerdict } from '../analysis/binaryMath.js';
 
 function generateReport() {
   console.log('================================================================');
@@ -68,6 +69,22 @@ function generateReport() {
       console.log(`• STRENGTH: Live market pairs are achieving ${(summary.liveWinRate - breakeven).toFixed(1)}% above breakeven threshold.`);
     }
   }
+
+  // Honest statistical verdict: could this win rate just be luck?
+  console.log('\n--- IS THERE A REAL EDGE? (statistics, not hope) ---');
+  const verdict = edgeVerdict(summary.wonTrades, summary.wonTrades + summary.lostTrades, summary.averagePayout || 85);
+  console.log(`• ${verdict.message}`);
+  if (verdict.verdict === 'PROVEN_EDGE') {
+    console.log('• Edge looks real on this sample. Keep logging: it must also hold on NEW trades.');
+  } else if (verdict.verdict === 'LIKELY_LOSING') {
+    console.log('• Stop and rethink the strategy. Trading it with real money would be expected to lose.');
+  } else {
+    console.log('• Keep logging demo trades. Judging a strategy takes hundreds of trades, not dozens.');
+  }
+
+  // Demo vs live split (a mixed-up journal makes every number above unreliable)
+  const demoTrades = trades.filter((t) => t.isDemo).length;
+  console.log(`\n--- ACCOUNT SPLIT ---\n• Demo trades: ${demoTrades} | Live trades: ${trades.length - demoTrades}`);
 
   console.log('================================================================\n');
   db.close();

@@ -7,6 +7,8 @@ import { SignalScheduler } from './analysis/signalScheduler.js';
 import { SignalPromptUI } from './ui/prompt.js';
 import { TradingSignal } from './analysis/signalEngine.js';
 import { TechnicalIndicators } from './analysis/indicators.js';
+import { normalizeAsset } from './stream/assets.js';
+import { analyzePriceStructure } from './analysis/marketQuality.js';
 
 async function bootstrap() {
   console.log('================================================================');
@@ -36,11 +38,25 @@ async function bootstrap() {
   const promptUI = new SignalPromptUI();
 
   let pendingArmedSignal: TradingSignal | null = null;
-  let lastMonitoredAsset = '';
 
-  // Track active streaming asset
-  sniffer.on('tick', (tick: any) => {
-    lastMonitoredAsset = tick.asset;
+  // Tell the user whenever the market on the chart changes
+  sniffer.on('activeAssetChanged', ({ asset, previous }: { asset: string; previous: string | null }) => {
+    const have = aggregator.getHistory(asset, 300).length;
+    console.log(
+      `\n[Market] Now analysing ${asset}${previous ? ` (was ${previous})` : ''}. ` +
+        `M5 candles ready: ${have}/25${have < 25 ? ' - warming up, signals start once 25 are collected' : ''}`
+    );
+  });
+
+  // Tell the user whenever the account changes (this is the safety-critical one)
+  sniffer.on('accountChanged', ({ mode, previous, source }: { mode: string; previous: string; source: string }) => {
+    if (mode === 'LIVE') {
+      console.log(`\n\x1b[41m\x1b[97m [Account] LIVE ACCOUNT ACTIVE - REAL MONEY \x1b[0m (detected from ${source})`);
+    } else if (mode === 'DEMO') {
+      console.log(`\n[Account] DEMO account active (detected from ${source}).`);
+    } else if (previous !== 'UNKNOWN') {
+      console.log(`\n[Account] Cannot tell which account is open any more. Check Quotex before trading.`);
+    }
   });
 
   // Notify when payouts update
@@ -66,7 +82,7 @@ async function bootstrap() {
 
   // Handle incoming high-probability signals
   scheduler.on('signal', async (signal: TradingSignal) => {
-    const decision = await promptUI.promptUser(signal);
+    const decision = await promptUI.promptUser(signal, sniffer.getAccountMode());
 
     if (decision.confirmed) {
       pendingArmedSignal = signal;
@@ -78,7 +94,7 @@ async function bootstrap() {
 
   // When a deal opens on Quotex, link the armed signal context if present
   watcher.on('tradeOpened', (trade) => {
-    if (pendingArmedSignal && pendingArmedSignal.asset === trade.asset) {
+    if (pendingArmedSignal && normalizeAsset(pendingArmedSignal.asset) === normalizeAsset(trade.asset)) {
       watcher.attachSignalContext(
         trade.id,
         pendingArmedSignal.confidence,
@@ -116,17 +132,19 @@ async function bootstrap() {
       .padStart(2, '0');
     const secStr = (remainingSec % 60).toString().padStart(2, '0');
 
-    if (sniffer.totalTicksReceived > 0 && lastMonitoredAsset) {
-      const latestTick = sniffer.getLatestTick(lastMonitoredAsset);
-      const payout = sniffer.getPayout(lastMonitoredAsset);
-      const history = aggregator.getHistory(lastMonitoredAsset, 300);
-      const currentCandle = aggregator.getCurrentCandle(lastMonitoredAsset, 300);
+    const activeAsset = sniffer.getActiveAsset();
+    const mode = sniffer.getAccountMode();
+    const modeStr = mode === 'LIVE' ? 'LIVE!' : mode === 'DEMO' ? 'demo' : '??';
+
+    if (sniffer.totalTicksReceived > 0 && activeAsset) {
+      const latestTick = sniffer.getLatestTick(activeAsset);
+      const payout = sniffer.getPayout(activeAsset);
+      const history = aggregator.getHistory(activeAsset, 300);
+      const currentCandle = aggregator.getCurrentCandle(activeAsset, 300);
 
       const closes = history.map((c) => c.close);
       if (currentCandle) closes.push(currentCandle.close);
 
-      let emaFastStr = '--';
-      let emaSlowStr = '--';
       let rsiStr = '--';
       let trendStr = 'RANGING';
 
@@ -139,22 +157,28 @@ async function bootstrap() {
         const es = emaSlow[emaSlow.length - 1];
         const r = rsi[rsi.length - 1];
 
-        emaFastStr = ef ? ef.toFixed(5) : '--';
-        emaSlowStr = es ? es.toFixed(5) : '--';
         rsiStr = r ? r.toFixed(1) : '--';
         trendStr = ef > es ? 'UPTREND' : ef < es ? 'DOWNTREND' : 'RANGING';
       }
 
+      const structure = analyzePriceStructure(closes, payout?.payoutPercent ?? 85);
+      const structureStr =
+        structure.verdict === 'INSUFFICIENT_DATA'
+          ? `warming up ${history.length}/25`
+          : structure.verdict === 'RANDOM_WALK_LIKE'
+            ? 'coin-flip-like'
+            : 'some pattern';
+
       process.stdout.write(
-        `\r[LIVE M5 ANALYSIS] ${lastMonitoredAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
+        `\r[${modeStr}] ${activeAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
           payout?.payoutPercent || '--'
-        }%) | Next Candle: ${minStr}:${secStr} | Trend: ${trendStr} | RSI: ${rsiStr} | Ticks: ${
+        }%) | Next M5: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Structure: ${structureStr} | Ticks: ${
           sniffer.totalTicksReceived
-        } `
+        }   `
       );
     } else {
       process.stdout.write(
-        `\r[STREAM ACTIVE] Waiting for active chart ticks... Next 5M candle in: ${minStr}:${secStr} | Total frames: ${sniffer.totalFramesReceived} `
+        `\r[STREAM ACTIVE] [${modeStr}] Waiting for chart data... Next 5M candle in: ${minStr}:${secStr} | Total frames: ${sniffer.totalFramesReceived} `
       );
     }
   }, 2000);

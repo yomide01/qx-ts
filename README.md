@@ -11,6 +11,7 @@ A TypeScript & Playwright-based trading companion built with human-in-the-loop c
 * **Phase 3 (Completed)**: Trade Outcome Journal & SQLite Analytics Database.
 * **Phase 4 (Completed)**: Mathematical Indicator & Setup Analysis Engine (EMA, RSI, Rejections).
 * **Phase 5 (Completed)**: Interactive Terminal / Desktop Alert Confirmation System.
+* **Phase 6 (Completed)**: Market-switch tracking, Demo/Live account detection, and honest binary-options maths.
 
 ---
 
@@ -98,3 +99,33 @@ npm start
 5. When you confirm and enter the trade on Quotex:
    - The trade watcher catches your deal and attaches the signal confidence and indicator snapshot into `./data/qx_trading.db`.
    - When the trade closes, it logs your outcome (`WON` / `LOST`), PnL, and updates your historical analytics.
+
+---
+
+## Phase 6: Market switching, Demo/Live detection and honest maths
+
+### The bot now follows the market on your chart
+Quotex only streams prices for the market(s) you have open on your chart, so the bot can only
+analyse those. Every name Quotex uses (`EURGBP_otc`, `EUR/GBP (OTC)`, `EUR/GBP OTC`) is now
+turned into one key, so switching to any OTC or live market works. The screen shows:
+`[Market] Now analysing GBPUSD_OTC ... M5 candles ready: 3/25`. A new market needs 25 five-minute
+candles (about 2 hours of history) before signals can appear.
+
+### The bot knows Demo from Live
+It reads the page address (`/demo-trade` = demo, `/trade` = live), Quotex's own account data, and the
+on-screen label, and reacts the moment you switch. The status line shows `[demo]` or `[LIVE!]`,
+LIVE gets a red banner, and trades are journaled under the correct account. If it cannot tell, it
+says `??` instead of guessing.
+
+### If it reads the wrong market or account after a Quotex update
+Run `npm run debug:dom` with Quotex open. It prints which page elements the bot can read.
+
+### What the bot can and cannot do
+Binary options are a fixed-odds bet: at an 85% payout you must win 54.05% of trades just to break even.
+The bot's "setup score" is a rule score, **not** a win probability. It cannot predict Quotex markets:
+OTC prices are produced by the broker, not a real market, and the live status line now reports
+`Structure: coin-flip-like` when a market shows no exploitable pattern. `npm run journal:report`
+now says whether your results are a real edge or could be luck. Test on a Demo account.
+
+### Tests
+`npm run test:unit` runs the market-switching, account-detection and maths tests.

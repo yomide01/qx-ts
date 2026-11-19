@@ -40,4 +40,8 @@ export interface TradeDeal {
   closePrice?: number;
   profit?: number;
   status: 'open' | 'won' | 'lost' | 'draw';
+  /** Only set when Quotex itself tells us which account the deal belongs to. */
+  isDemo?: boolean;
 }
+
+export type AccountMode = 'DEMO' | 'LIVE' | 'UNKNOWN';

@@ -3,8 +3,11 @@ import { QxWsSniffer } from '../stream/wsSniffer.js';
 import { TradingJournalDB } from './database.js';
 import { TradeDeal } from '../stream/types.js';
 import { TradeRecord, IndicatorSnapshot } from './types.js';
+import { isOtcAsset } from '../stream/assets.js';
 
 export class TradeWatcher extends EventEmitter {
+  private warnedUnknownMode = false;
+
   constructor(
     private sniffer: QxWsSniffer,
     private db: TradingJournalDB
@@ -17,8 +20,23 @@ export class TradeWatcher extends EventEmitter {
     const existing = this.db.getTrade(deal.id);
     const assetPayout = this.sniffer.getPayout(deal.asset);
     const payoutPercent = assetPayout?.payoutPercent ?? 80;
-    const isOtc = assetPayout?.isOtc ?? deal.asset.toLowerCase().includes('otc');
-    const isDemo = this.sniffer.getBalance()?.isDemo ?? true;
+    const isOtc = assetPayout?.isOtc ?? isOtcAsset(deal.asset);
+
+    // Which account was this trade on? Prefer what Quotex says about the deal itself, then the
+    // account the bot currently sees open. Never silently assume demo.
+    const mode = this.sniffer.getAccountMode();
+    let isDemo: boolean;
+    if (deal.isDemo !== undefined) {
+      isDemo = deal.isDemo;
+    } else if (mode !== 'UNKNOWN') {
+      isDemo = mode === 'DEMO';
+    } else {
+      isDemo = true;
+      if (!this.warnedUnknownMode) {
+        this.warnedUnknownMode = true;
+        console.warn('\n[TradeWatcher] WARNING: cannot tell if you are on Demo or Live. Logging this trade as DEMO.');
+      }
+    }
 
     if (!existing) {
       // New trade opening
