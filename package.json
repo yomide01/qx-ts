@@ -1,0 +1,26 @@
+{
+  "name": "qx-ts",
+  "version": "1.0.0",
+  "description": "Quotex Semi-Automated Trading Assistant & Stream Watcher",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "browser:init": "tsx src/browser/launch.ts",
+    "stream:test": "tsx src/stream/testSniffer.ts",
+    "debug:ws": "tsx src/stream/wsDebugger.ts",
+    "journal:report": "tsx src/journal/report.ts",
+    "prompt:test": "tsx src/testDryRun.ts",
+    "test": "tsx src/systemDiagnostics.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^26.6.6",
+    "dotenv": "^18.0.10",
+    "playwright": "^1.65.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

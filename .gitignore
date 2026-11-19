@@ -1,0 +1,8 @@
+node_modules/
+dist/
+qx_user_profile/
+.env
+*.log
+*.db
+data/*.jsonl
+data/*.db
