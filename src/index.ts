@@ -146,6 +146,7 @@ async function bootstrap() {
       if (currentCandle) closes.push(currentCandle.close);
 
       let rsiStr = '--';
+      let stochStr = '--';
       let trendStr = 'RANGING';
 
       if (closes.length >= 21) {
@@ -158,6 +159,8 @@ async function bootstrap() {
         const r = rsi[rsi.length - 1];
 
         rsiStr = r ? r.toFixed(1) : '--';
+        const st = TechnicalIndicators.calculateStochastic(history.concat(currentCandle ? [currentCandle] : []), 14, 3, 3);
+        if (st.k.length > 0) stochStr = st.k[st.k.length - 1].toFixed(0);
         trendStr = ef > es ? 'UPTREND' : ef < es ? 'DOWNTREND' : 'RANGING';
       }
 
@@ -172,7 +175,7 @@ async function bootstrap() {
       process.stdout.write(
         `\r[${modeStr}] ${activeAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
           payout?.payoutPercent || '--'
-        }%) | Next M5: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Structure: ${structureStr} | Ticks: ${
+        }%) | Next M5: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Stoch ${stochStr} | Structure: ${structureStr} | Ticks: ${
           sniffer.totalTicksReceived
         }   `
       );

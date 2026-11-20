@@ -41,9 +41,12 @@ export class SignalPromptUI {
       )}${cyan}║${resetColor}`
     );
     console.log(
-      `${cyan}║${resetColor} Entry Time : ${yellow}${new Date(signal.entryTime).toLocaleTimeString()}${resetColor} (Expiry: ${new Date(
+      `${cyan}║${resetColor} Entry Time : ${yellow}${new Date(signal.entryTime).toLocaleTimeString()}${resetColor} (ends ${new Date(
         signal.expiryTime
-      ).toLocaleTimeString()}) ${' '.repeat(24)}${cyan}║${resetColor}`
+      ).toLocaleTimeString()}) ${' '.repeat(26)}${cyan}║${resetColor}`
+    );
+    console.log(
+      `${cyan}║${resetColor} Expiry     : ${bold}${signal.expiryMinutes} minutes${resetColor} - rules say price ends ${bold}${isCall ? 'HIGHER' : 'LOWER'}${resetColor} than entry`
     );
     const accountLabel =
       accountMode === 'LIVE' ? '\x1b[41m\x1b[97m LIVE - REAL MONEY \x1b[0m' : accountMode === 'DEMO' ? 'DEMO' : 'UNKNOWN (check Quotex!)';

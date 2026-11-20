@@ -129,3 +129,25 @@ now says whether your results are a real edge or could be luck. Test on a Demo a
 
 ### Tests
 `npm run test:unit` runs the market-switching, account-detection and maths tests.
+
+---
+
+## Strategy: EMA + RSI + Stochastic (5-minute candles)
+
+The bot signals only when all three line up on closed M5 candles:
+
+| | CALL (price UP) | PUT (price DOWN) |
+|---|---|---|
+| Trend | EMA 9 above EMA 21 | EMA 9 below EMA 21 |
+| Momentum | RSI 40-70 and rising | RSI 30-60 and falling |
+| Timing | Stochastic %K crosses UP through %D while %K < 40 | %K crosses DOWN through %D while %K > 60 |
+
+Every signal states the direction and the **expiry (5 minutes)**, and lists the exact indicator values
+that triggered it. This is the classic "buy the dip in an uptrend" rule set. It follows the rules
+exactly; it cannot know the future, so judge it by your own Demo results (`npm run journal:report`).
+
+## Protocol fixes (from studying pyquotex)
+* Balance messages use the names `liveBalance` / `demoBalance` (both accounts in one message).
+* The browser's own `account/change` / `authorization` messages are read (demo flag only, never the
+  login session) so a Demo/Live switch is noticed instantly. The most recent clue always wins.
+* Quotex keeps a separate payout per expiry length; a 5-minute trade now uses the 5-minute payout.

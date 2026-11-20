@@ -83,6 +83,47 @@ export class TechnicalIndicators {
   }
 
   /**
+   * Slow Stochastic Oscillator (default 14, 3, 3).
+   * %K shows where the close sits inside the recent high-low range (0 = at the lowest low,
+   * 100 = at the highest high); %D is a smoothed copy of %K used for crossover timing.
+   * Both arrays end at the most recent candle.
+   */
+  public static calculateStochastic(
+    candles: Candle[],
+    kPeriod: number = 14,
+    kSmooth: number = 3,
+    dPeriod: number = 3
+  ): { k: number[]; d: number[] } {
+    if (candles.length < kPeriod) return { k: [], d: [] };
+
+    const raw: number[] = [];
+    for (let i = kPeriod - 1; i < candles.length; i++) {
+      let hh = -Infinity;
+      let ll = Infinity;
+      for (let j = i - kPeriod + 1; j <= i; j++) {
+        hh = Math.max(hh, candles[j].high);
+        ll = Math.min(ll, candles[j].low);
+      }
+      raw.push(hh === ll ? 50 : (100 * (candles[i].close - ll)) / (hh - ll));
+    }
+
+    const sma = (values: number[], period: number): number[] => {
+      if (values.length < period) return [];
+      const out: number[] = [];
+      for (let i = period - 1; i < values.length; i++) {
+        let sum = 0;
+        for (let j = i - period + 1; j <= i; j++) sum += values[j];
+        out.push(sum / period);
+      }
+      return out;
+    };
+
+    const k = sma(raw, kSmooth);
+    const d = sma(k, dPeriod);
+    return { k, d };
+  }
+
+  /**
    * Bollinger Bands (20 period, 2 std dev)
    */
   public static calculateBollingerBands(

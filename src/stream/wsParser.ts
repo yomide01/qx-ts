@@ -203,16 +203,26 @@ export class QxWsParser {
         if (Array.isArray(item) && item.length >= 6) {
           const rawSymbol = String(item[1] || '');
           const rawName = String(item[2] || rawSymbol);
-          const payoutVal = Number(item[5]);
+          const generalPayout = QxWsParser.toPercent(item[5]);
 
-          if (rawSymbol && !isNaN(payoutVal) && payoutVal > 0) {
+          // Quotex stores a separate payout for each expiry length near the END of the row
+          // (second-to-last groups: 1 minute, 5 minutes). Trading a 5-minute candle must use the
+          // 5-minute figure, which can differ from the general one in item[5].
+          const fromEnd = (n: number) => (item.length >= 20 ? QxWsParser.toPercent(item[item.length - n]) : null);
+          const payout1m = fromEnd(9);
+          const payout5m = fromEnd(8);
+          const payoutVal = payout5m ?? generalPayout;
+
+          if (rawSymbol && payoutVal !== null && payoutVal > 0) {
             const isOtc = rawSymbol.toLowerCase().includes('otc') || rawName.toLowerCase().includes('otc');
             const cleanAsset = normalizeAsset(rawSymbol);
 
             payouts.push({
               asset: cleanAsset,
               name: rawName,
-              payoutPercent: payoutVal > 1 ? payoutVal : payoutVal * 100,
+              payoutPercent: payoutVal,
+              payout1mPercent: payout1m ?? undefined,
+              payout5mPercent: payout5m ?? undefined,
               isOtc,
               isActive: item[14] !== false,
             });
@@ -245,6 +255,50 @@ export class QxWsParser {
   /**
    * Extracts balance from authorization or balance packets.
    */
+  /** Turns a payout number into a percentage (85 or 0.85 -> 85). Returns null if it is not a sane payout. */
+  public static toPercent(raw: unknown): number | null {
+    const n = Number(raw);
+    if (!isFinite(n) || n <= 0) return null;
+    const pct = n <= 1 ? n * 100 : n;
+    return pct >= 1 && pct <= 100 ? pct : null;
+  }
+
+  /**
+   * Quotex sends BOTH account balances together: { liveBalance, demoBalance }.
+   * (They do not say which account is open - that comes from the account tracker.)
+   */
+  public extractBalances(data: any): { live?: number; demo?: number } | null {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const live = data.liveBalance ?? data.live_balance;
+    const demo = data.demoBalance ?? data.demo_balance;
+    if (live === undefined && demo === undefined) return null;
+    const out: { live?: number; demo?: number } = {};
+    if (live !== undefined && isFinite(Number(live))) out.live = Number(live);
+    if (demo !== undefined && isFinite(Number(demo))) out.demo = Number(demo);
+    return out.live === undefined && out.demo === undefined ? null : out;
+  }
+
+  /**
+   * Reads which account a message the BROWSER SENT refers to. Quotex's page sends
+   *   42["account/change",{"demo":1,...}]   when you switch account (1 = demo, 0 = live)
+   *   42["authorization",{"isDemo":1,...}]  when it connects
+   * Only the demo/live flag is read. The authorization message also carries your login
+   * session; that is deliberately never read, stored or printed.
+   */
+  public static parseOutgoingAccountFrame(payload: string | Buffer): boolean | null {
+    try {
+      const text = (typeof payload === 'string' ? payload : payload.toString('utf-8')).replace(/^[\x00-\x1F]+/, '').trim();
+      const m = text.match(/^\d+(?:-\d+)?\["(account\/change|authorization)",(\{.*\})\]$/s);
+      if (!m) return null;
+      const obj = JSON.parse(m[2]);
+      const raw = m[1] === 'account/change' ? obj.demo : obj.isDemo;
+      if (raw === undefined || raw === null) return null;
+      return Boolean(Number(raw) || raw === true || raw === 'true');
+    } catch {
+      return null;
+    }
+  }
+
   public extractBalance(eventName: string, data: any): AccountBalance | null {
     if (!data || typeof data !== 'object') return null;
 
