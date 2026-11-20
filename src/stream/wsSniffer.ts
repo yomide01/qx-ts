@@ -3,6 +3,7 @@ import { Page, CDPSession, WebSocket as PlaywrightWebSocket } from 'playwright';
 import { QxWsParser, ParsedWsMessage } from './wsParser.js';
 import { Tick, AssetPayout, AccountBalance, TradeDeal, AccountMode } from './types.js';
 import { AssetRegistry, normalizeAsset } from './assets.js';
+import { AccountModeTracker } from './accountTracker.js';
 
 export interface QxWsSnifferEvents {
   tick: (tick: Tick) => void;
@@ -42,12 +43,12 @@ export class QxWsSniffer extends EventEmitter {
   private activeAsset: string | null = null;
 
   // ── Which account (demo / live) is open right now ──
-  // Three independent clues; the page address is the most reliable, then an explicit
-  // flag from Quotex's own data, then the label shown on screen.
-  private urlMode: AccountMode = 'UNKNOWN';
-  private wsMode: AccountMode = 'UNKNOWN';
-  private domMode: AccountMode = 'UNKNOWN';
+  // Clues: the page address, the account/change + authorization messages the page sends,
+  // and (last resort) the on-screen label. The most recent change wins (see accountTracker).
+  private tracker = new AccountModeTracker();
   private accountMode: AccountMode = 'UNKNOWN';
+  private liveBalanceValue: number | null = null;
+  private demoBalanceValue: number | null = null;
 
   public totalFramesReceived: number = 0;
   public totalTicksReceived: number = 0;
@@ -75,6 +76,11 @@ export class QxWsSniffer extends EventEmitter {
         this.handleIncomingFrame(payload);
       });
 
+      // Frames the page SENDS: this is how we see "account/change" the instant you switch.
+      ws.on('framesent', ({ payload }) => {
+        this.handleOutgoingFrame(payload);
+      });
+
       ws.on('close', () => {
         this.activeSockets.delete(ws);
       });
@@ -89,6 +95,13 @@ export class QxWsSniffer extends EventEmitter {
         const payloadData = event.response?.payloadData;
         if (payloadData) {
           this.handleIncomingFrame(payloadData);
+        }
+      });
+
+      this.cdpSession.on('Network.webSocketFrameSent', (event: any) => {
+        const payloadData = event.response?.payloadData;
+        if (payloadData) {
+          this.handleOutgoingFrame(payloadData);
         }
       });
 
@@ -171,10 +184,12 @@ export class QxWsSniffer extends EventEmitter {
 
         // ── Account ──
         this.setUrlMode(accountModeFromUrl(dom.url));
-        this.domMode = dom.labelMode as AccountMode;
-        this.refreshAccountMode('screen');
+        this.tracker.update('screen label', dom.labelMode as AccountMode);
+        this.refreshAccountMode();
 
-        if (dom.balance) {
+        // The on-screen balance is only a fallback for when Quotex's own balance message has
+        // not been seen (that one is exact and carries both accounts).
+        if (dom.balance && this.liveBalanceValue === null && this.demoBalanceValue === null) {
           const balNum = parseFloat(dom.balance.replace(/,/g, ''));
           if (!isNaN(balNum)) this.updateBalance(balNum, 'USD');
         }
@@ -225,20 +240,37 @@ export class QxWsSniffer extends EventEmitter {
   // ───────────────────────── account mode ─────────────────────────
 
   private setUrlMode(mode: AccountMode): void {
-    this.urlMode = mode;
-    this.refreshAccountMode('page address');
+    this.tracker.update('page address', mode);
+    this.refreshAccountMode();
   }
 
-  private refreshAccountMode(source: string): void {
-    const next: AccountMode =
-      this.urlMode !== 'UNKNOWN' ? this.urlMode : this.wsMode !== 'UNKNOWN' ? this.wsMode : this.domMode;
+  /** Reads messages the browser sent to Quotex (account switches / connecting). */
+  public handleOutgoingFrame(payload: string | Buffer): void {
+    const isDemo = QxWsParser.parseOutgoingAccountFrame(payload);
+    if (isDemo === null) return;
+    this.tracker.update('Quotex request', isDemo ? 'DEMO' : 'LIVE');
+    this.refreshAccountMode();
+  }
+
+  private refreshAccountMode(): void {
+    const next = this.tracker.current();
     if (next === this.accountMode) return;
     const previous = this.accountMode;
     this.accountMode = next;
-    if (this.currentBalance && next !== 'UNKNOWN') {
-      this.currentBalance = { ...this.currentBalance, isDemo: next === 'DEMO' };
-    }
-    this.emit('accountChanged', { mode: next, previous, source });
+    this.refreshBalanceForMode();
+    this.emit('accountChanged', { mode: next, previous, source: this.tracker.source() });
+  }
+
+  /** Picks the balance of the account that is open right now. */
+  private refreshBalanceForMode(): void {
+    const mode = this.accountMode;
+    const value = mode === 'LIVE' ? this.liveBalanceValue : mode === 'DEMO' ? this.demoBalanceValue : null;
+    if (value === null) return;
+    const currency = this.currentBalance?.currency ?? 'USD';
+    const changed =
+      !this.currentBalance || this.currentBalance.balance !== value || this.currentBalance.isDemo !== (mode === 'DEMO');
+    this.currentBalance = { balance: value, currency, isDemo: mode === 'DEMO' };
+    if (changed) this.emit('balance', this.currentBalance);
   }
 
   private updateBalance(balance: number, currency: string): void {
@@ -345,13 +377,22 @@ export class QxWsSniffer extends EventEmitter {
       this.emit('payouts', payouts);
     }
 
-    // Check for Balance (only when Quotex states which account it belongs to)
-    const balance = this.parser.extractBalance(eventName, data);
-    if (balance) {
-      this.wsMode = balance.isDemo ? 'DEMO' : 'LIVE';
-      this.refreshAccountMode('Quotex data');
-      this.currentBalance = { ...balance, isDemo: this.accountMode === 'UNKNOWN' ? balance.isDemo : this.accountMode === 'DEMO' };
-      this.emit('balance', this.currentBalance);
+    // Check for Balances: Quotex sends { liveBalance, demoBalance } together
+    const balances = this.parser.extractBalances(data);
+    if (balances) {
+      if (balances.live !== undefined) this.liveBalanceValue = balances.live;
+      if (balances.demo !== undefined) this.demoBalanceValue = balances.demo;
+      this.refreshBalanceForMode();
+    } else {
+      // Older/explicit format that states which account the balance belongs to
+      const balance = this.parser.extractBalance(eventName, data);
+      if (balance) {
+        this.tracker.update('Quotex request', balance.isDemo ? 'DEMO' : 'LIVE');
+        this.refreshAccountMode();
+        if (balance.isDemo) this.demoBalanceValue = balance.balance;
+        else this.liveBalanceValue = balance.balance;
+        this.refreshBalanceForMode();
+      }
     }
 
     // Check for Deal

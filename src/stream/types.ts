@@ -18,7 +18,11 @@ export interface Candle {
 export interface AssetPayout {
   asset: string;
   name: string;
+  /** Payout that applies to a 5-minute trade when Quotex states it, else the general payout. */
   payoutPercent: number; // e.g. 85 for 85%
+  /** Quotex keeps a separate payout per expiry length. Present when the list provides them. */
+  payout1mPercent?: number;
+  payout5mPercent?: number;
   isOtc: boolean;
   isActive: boolean;
 }

@@ -5,24 +5,39 @@ import { TechnicalIndicators } from './indicators.js';
 export interface TradingSignal {
   asset: string;
   isOtc: boolean;
-  direction: 'CALL' | 'PUT';
+  direction: 'CALL' | 'PUT'; // CALL = price higher at expiry, PUT = price lower at expiry
   timeframeSeconds: number; // 300 for 5M
+  expiryMinutes: number; // how long the trade should run
   entryTime: number; // target candle open timestamp
   expiryTime: number; // target candle close timestamp
-  confidence: number; // 0-100%
+  confidence: number; // setup score 0-100 (a rule score, NOT a win probability)
   payoutPercent: number;
   reasons: string[];
   marketRegime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY';
   indicatorSnapshot: IndicatorSnapshot;
 }
 
+/**
+ * Strategy: EMA trend + RSI momentum + Stochastic timing, on closed 5-minute candles.
+ *
+ * CALL (price UP for the next 5 minutes) needs ALL THREE:
+ *   1. TREND     EMA 9 is above EMA 21 (uptrend)
+ *   2. MOMENTUM  RSI(14) is between 40 and 70 and rising (healthy, not overbought)
+ *   3. TIMING    Stochastic %K crosses UP through %D while %K is still low (< 40):
+ *                the pullback inside the uptrend has ended
+ * PUT is the exact mirror (EMA 9 < EMA 21, RSI 30-60 and falling, %K crosses DOWN through %D
+ * while %K is high, > 60).
+ *
+ * This is a classic "buy the dip in an uptrend" rule set. It follows the rules exactly and
+ * will say when they line up. It cannot know the future: whether the rules beat the broker's
+ * payout margin is something only your own results can show.
+ */
 export class SignalEngine {
   public minPayoutPercent: number = 80;
-  public minConfidenceThreshold: number = 70;
+  /** All three core rules together score 60, so 60 means "the full set lined up". */
+  public minConfidenceThreshold: number = 60;
+  public readonly timeframeSeconds: number = 300;
 
-  /**
-   * Evaluates closed candles to determine if a high-probability 5M setup exists.
-   */
   public evaluateSetup(
     asset: string,
     isOtc: boolean,
@@ -30,230 +45,139 @@ export class SignalEngine {
     payoutPercent: number,
     targetEntryTime: number
   ): TradingSignal | null {
-    // Filter 1: Payout must meet threshold to maintain positive Expected Value
-    if (payoutPercent < this.minPayoutPercent) {
-      return null;
-    }
+    // Payout filter: a low payout makes break-even harder to reach
+    if (payoutPercent < this.minPayoutPercent) return null;
 
-    // Filter 2: Sufficient candle history for reliable indicators
-    if (candles.length < 25) {
-      return null;
-    }
+    // Need enough closed candles for EMA 21, RSI 14 and the slow Stochastic
+    if (candles.length < 25) return null;
 
     const closes = candles.map((c) => c.close);
-    const lastCandle = candles[candles.length - 1];
+    const emaFastArr = TechnicalIndicators.calculateEMA(closes, 9);
+    const emaSlowArr = TechnicalIndicators.calculateEMA(closes, 21);
+    const rsiArr = TechnicalIndicators.calculateRSI(closes, 14);
+    const stoch = TechnicalIndicators.calculateStochastic(candles, 14, 3, 3);
 
-    // Compute indicators
-    const emaFast = TechnicalIndicators.calculateEMA(closes, 9);
-    const emaSlow = TechnicalIndicators.calculateEMA(closes, 21);
-    const rsi = TechnicalIndicators.calculateRSI(closes, 14);
+    if (emaFastArr.length < 4 || emaSlowArr.length < 1 || rsiArr.length < 2 || stoch.k.length < 2 || stoch.d.length < 2) {
+      return null;
+    }
+
+    const last = (arr: number[], back = 0) => arr[arr.length - 1 - back];
+    const emaFast = last(emaFastArr);
+    const emaSlow = last(emaSlowArr);
+    const rsi = last(rsiArr);
+    const rsiPrev = last(rsiArr, 1);
+    const k = last(stoch.k);
+    const kPrev = last(stoch.k, 1);
+    const d = last(stoch.d);
+    const dPrev = last(stoch.d, 1);
+
+    // Trend strength: is the gap between the EMAs widening compared with 3 candles ago?
+    const slowAt = (back: number) => emaSlowArr[emaSlowArr.length - 1 - back];
+    const gapNow = Math.abs(emaFast - emaSlow);
+    const gapBefore = Math.abs(last(emaFastArr, 3) - slowAt(3));
+    const gapWidening = slowAt(3) !== undefined && gapNow > gapBefore;
+
     const bb = TechnicalIndicators.calculateBollingerBands(closes, 20);
+    const lastCandle = candles[candles.length - 1];
     const wick = TechnicalIndicators.analyzeCandleWicks(lastCandle);
     const regime = TechnicalIndicators.classifyRegime(candles);
 
-    if (emaFast.length === 0 || emaSlow.length === 0 || rsi.length === 0 || !bb) {
-      return null;
-    }
-
-    const currentEmaFast = emaFast[emaFast.length - 1];
-    const currentEmaSlow = emaSlow[emaSlow.length - 1];
-    const currentRsi = rsi[rsi.length - 1];
-    const currentClose = closes[closes.length - 1];
-
+    // Recorded in the journal for reference only; they play no part in the decision.
     const indicatorSnapshot: IndicatorSnapshot = {
-      emaFast: currentEmaFast,
-      emaSlow: currentEmaSlow,
-      rsi: currentRsi,
-      bbUpper: bb.upper,
-      bbLower: bb.lower,
-      bbMiddle: bb.middle,
+      emaFast,
+      emaSlow,
+      rsi,
+      bbUpper: bb?.upper ?? 0,
+      bbLower: bb?.lower ?? 0,
+      bbMiddle: bb?.middle ?? 0,
       candleWickRatio: Math.max(wick.upperWickRatio, wick.lowerWickRatio),
     };
 
-    // Evaluate CALL (GREEN / UP) Setup
-    const callSignal = this.evaluateCallSetup(
-      asset,
-      isOtc,
-      currentClose,
-      currentEmaFast,
-      currentEmaSlow,
-      currentRsi,
-      bb,
-      wick,
-      regime,
-      payoutPercent,
-      targetEntryTime,
-      indicatorSnapshot
-    );
+    const crossedUp = kPrev <= dPrev && k > d;
+    const crossedDown = kPrev >= dPrev && k < d;
 
-    if (callSignal && callSignal.confidence >= this.minConfidenceThreshold) {
-      return callSignal;
+    // ---------- CALL ----------
+    if (emaFast > emaSlow && rsi >= 40 && rsi <= 70 && rsi > rsiPrev && crossedUp && Math.min(k, kPrev) < 40) {
+      let score = 60;
+      const reasons = [
+        `TREND: EMA 9 (${emaFast.toFixed(5)}) above EMA 21 (${emaSlow.toFixed(5)}) = uptrend`,
+        `MOMENTUM: RSI ${rsi.toFixed(1)}, rising from ${rsiPrev.toFixed(1)} (zone 40-70)`,
+        `TIMING: Stochastic %K ${k.toFixed(1)} crossed UP through %D ${d.toFixed(1)} from a low zone`,
+      ];
+      if (Math.min(k, kPrev) < 20) {
+        score += 10;
+        reasons.push('Bonus: Stochastic turned up from deeply oversold (< 20)');
+      }
+      if (rsi >= 45 && rsi <= 60) {
+        score += 10;
+        reasons.push('Bonus: RSI in the middle of its healthy zone (45-60)');
+      }
+      if (gapWidening) {
+        score += 10;
+        reasons.push('Bonus: gap between EMA 9 and EMA 21 is widening (trend strengthening)');
+      }
+      if (payoutPercent >= 85) {
+        score += 5;
+        reasons.push(`Bonus: high payout (${payoutPercent.toFixed(0)}%)`);
+      }
+      return this.build('CALL', asset, isOtc, targetEntryTime, score, payoutPercent, reasons, regime, indicatorSnapshot);
     }
 
-    // Evaluate PUT (RED / DOWN) Setup
-    const putSignal = this.evaluatePutSetup(
-      asset,
-      isOtc,
-      currentClose,
-      currentEmaFast,
-      currentEmaSlow,
-      currentRsi,
-      bb,
-      wick,
-      regime,
-      payoutPercent,
-      targetEntryTime,
-      indicatorSnapshot
-    );
-
-    if (putSignal && putSignal.confidence >= this.minConfidenceThreshold) {
-      return putSignal;
+    // ---------- PUT ----------
+    if (emaFast < emaSlow && rsi <= 60 && rsi >= 30 && rsi < rsiPrev && crossedDown && Math.max(k, kPrev) > 60) {
+      let score = 60;
+      const reasons = [
+        `TREND: EMA 9 (${emaFast.toFixed(5)}) below EMA 21 (${emaSlow.toFixed(5)}) = downtrend`,
+        `MOMENTUM: RSI ${rsi.toFixed(1)}, falling from ${rsiPrev.toFixed(1)} (zone 30-60)`,
+        `TIMING: Stochastic %K ${k.toFixed(1)} crossed DOWN through %D ${d.toFixed(1)} from a high zone`,
+      ];
+      if (Math.max(k, kPrev) > 80) {
+        score += 10;
+        reasons.push('Bonus: Stochastic turned down from deeply overbought (> 80)');
+      }
+      if (rsi >= 40 && rsi <= 55) {
+        score += 10;
+        reasons.push('Bonus: RSI in the middle of its healthy zone (40-55)');
+      }
+      if (gapWidening) {
+        score += 10;
+        reasons.push('Bonus: gap between EMA 9 and EMA 21 is widening (trend strengthening)');
+      }
+      if (payoutPercent >= 85) {
+        score += 5;
+        reasons.push(`Bonus: high payout (${payoutPercent.toFixed(0)}%)`);
+      }
+      return this.build('PUT', asset, isOtc, targetEntryTime, score, payoutPercent, reasons, regime, indicatorSnapshot);
     }
 
     return null;
   }
 
-  private evaluateCallSetup(
+  private build(
+    direction: 'CALL' | 'PUT',
     asset: string,
     isOtc: boolean,
-    close: number,
-    emaFast: number,
-    emaSlow: number,
-    rsi: number,
-    bb: { upper: number; middle: number; lower: number },
-    wick: { lowerWickRatio: number; upperWickRatio: number; isBullish: boolean },
-    regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY',
-    payout: number,
     entryTime: number,
-    indicators: IndicatorSnapshot
+    score: number,
+    payoutPercent: number,
+    reasons: string[],
+    regime: TradingSignal['marketRegime'],
+    indicatorSnapshot: IndicatorSnapshot
   ): TradingSignal | null {
-    let score = 50;
-    const reasons: string[] = [];
-
-    // Trend Confluence
-    if (regime === 'TRENDING_UP' && emaFast > emaSlow) {
-      score += 10;
-      reasons.push('Trend alignment: M5 Uptrend (EMA 9 > EMA 21)');
-    } else if (regime === 'RANGING') {
-      score += 5;
-      reasons.push('Range boundary: Market in consolidation');
-    }
-
-    // RSI Condition (Oversold bounce or momentum continuation)
-    if (rsi <= 35) {
-      score += 10;
-      reasons.push(`RSI Oversold condition (${rsi.toFixed(1)} <= 35)`);
-    } else if (regime === 'TRENDING_UP' && rsi >= 45 && rsi <= 60) {
-      score += 5;
-      reasons.push(`RSI healthy bullish momentum (${rsi.toFixed(1)})`);
-    }
-
-    // Bollinger Band Interaction
-    if (close <= bb.lower * 1.0005) {
-      score += 10;
-      reasons.push('Price touching / piercing Lower Bollinger Band');
-    }
-
-    // Candle Rejection Wick (Strong buying wick at bottom)
-    if (wick.lowerWickRatio >= 0.35) {
-      score += 10;
-      reasons.push(
-        `Prominent lower rejection wick (${(wick.lowerWickRatio * 100).toFixed(0)}% of candle)`
-      );
-    }
-
-    // High Payout bonus
-    if (payout >= 85) {
-      score += 5;
-      reasons.push(`High payout tier (${payout.toFixed(0)}%)`);
-    }
-
     if (score < this.minConfidenceThreshold) return null;
-
     return {
       asset,
       isOtc,
-      direction: 'CALL',
-      timeframeSeconds: 300,
+      direction,
+      timeframeSeconds: this.timeframeSeconds,
+      expiryMinutes: this.timeframeSeconds / 60,
       entryTime,
-      expiryTime: entryTime + 300000,
+      expiryTime: entryTime + this.timeframeSeconds * 1000,
       confidence: Math.min(score, 95),
-      payoutPercent: payout,
+      payoutPercent,
       reasons,
       marketRegime: regime,
-      indicatorSnapshot: indicators,
-    };
-  }
-
-  private evaluatePutSetup(
-    asset: string,
-    isOtc: boolean,
-    close: number,
-    emaFast: number,
-    emaSlow: number,
-    rsi: number,
-    bb: { upper: number; middle: number; lower: number },
-    wick: { lowerWickRatio: number; upperWickRatio: number; isBullish: boolean },
-    regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY',
-    payout: number,
-    entryTime: number,
-    indicators: IndicatorSnapshot
-  ): TradingSignal | null {
-    let score = 50;
-    const reasons: string[] = [];
-
-    // Trend Confluence
-    if (regime === 'TRENDING_DOWN' && emaFast < emaSlow) {
-      score += 10;
-      reasons.push('Trend alignment: M5 Downtrend (EMA 9 < EMA 21)');
-    } else if (regime === 'RANGING') {
-      score += 5;
-      reasons.push('Range boundary: Market in consolidation');
-    }
-
-    // RSI Condition (Overbought drop or momentum continuation)
-    if (rsi >= 65) {
-      score += 10;
-      reasons.push(`RSI Overbought condition (${rsi.toFixed(1)} >= 65)`);
-    } else if (regime === 'TRENDING_DOWN' && rsi >= 40 && rsi <= 55) {
-      score += 5;
-      reasons.push(`RSI healthy bearish momentum (${rsi.toFixed(1)})`);
-    }
-
-    // Bollinger Band Interaction
-    if (close >= bb.upper * 0.9995) {
-      score += 10;
-      reasons.push('Price touching / piercing Upper Bollinger Band');
-    }
-
-    // Candle Rejection Wick (Strong selling wick at top)
-    if (wick.upperWickRatio >= 0.35) {
-      score += 10;
-      reasons.push(
-        `Prominent upper rejection wick (${(wick.upperWickRatio * 100).toFixed(0)}% of candle)`
-      );
-    }
-
-    // High Payout bonus
-    if (payout >= 85) {
-      score += 5;
-      reasons.push(`High payout tier (${payout.toFixed(0)}%)`);
-    }
-
-    if (score < this.minConfidenceThreshold) return null;
-
-    return {
-      asset,
-      isOtc,
-      direction: 'PUT',
-      timeframeSeconds: 300,
-      entryTime,
-      expiryTime: entryTime + 300000,
-      confidence: Math.min(score, 95),
-      payoutPercent: payout,
-      reasons,
-      marketRegime: regime,
-      indicatorSnapshot: indicators,
+      indicatorSnapshot,
     };
   }
 }

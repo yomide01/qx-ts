@@ -1,6 +1,7 @@
 import { TechnicalIndicators } from './indicators.js';
 import { SignalEngine } from './signalEngine.js';
 import { Candle } from '../stream/types.js';
+import { candlesFromCloses, pullbackSeries } from './testSeries.js';
 
 function runAnalysisTests() {
   console.log('--- Testing Phase 4: Mathematical Indicators & Signal Engine ---');
@@ -51,49 +52,58 @@ function runAnalysisTests() {
   }
   console.log(`✓ Rejection wick analysis passed (Lower wick ratio: ${(wickAnalysis.lowerWickRatio * 100).toFixed(0)}%)`);
 
-  // Test 5: Signal Engine Call Setup Evaluation
+  // Test 5: Stochastic oscillator
+  const rising = candlesFromCloses(Array.from({ length: 30 }, (_, i) => 1 + i * 0.001));
+  const falling = candlesFromCloses(Array.from({ length: 30 }, (_, i) => 1 - i * 0.001));
+  const stRise = TechnicalIndicators.calculateStochastic(rising);
+  const stFall = TechnicalIndicators.calculateStochastic(falling);
+  if (stRise.k[stRise.k.length - 1] < 85) throw new Error(`Stochastic should be high in a rising market: ${stRise.k.at(-1)}`);
+  if (stFall.k[stFall.k.length - 1] > 15) throw new Error(`Stochastic should be low in a falling market: ${stFall.k.at(-1)}`);
+  const allVals = [...stRise.k, ...stRise.d, ...stFall.k, ...stFall.d];
+  if (allVals.some((v) => v < 0 || v > 100)) throw new Error('Stochastic left the 0-100 range');
+  if (TechnicalIndicators.calculateStochastic(rising.slice(0, 10)).k.length !== 0) throw new Error('Stochastic should be empty with too little data');
+  console.log('✓ Stochastic oscillator passed (rising -> high, falling -> low, always 0-100)');
+
   const engine = new SignalEngine();
-  // Build a synthetic 30-candle sequence exhibiting a CALL setup at support
-  const mockCandles: Candle[] = [];
-  const baseTime = Date.now() - 30 * 300000;
-  for (let i = 0; i < 29; i++) {
-    const p = 1.0500 + i * 0.0002;
-    mockCandles.push({
-      asset: 'EURUSD',
-      timeframe: 300,
-      openTime: baseTime + i * 300000,
-      open: p,
-      high: p + 0.0003,
-      low: p - 0.0001,
-      close: p + 0.0002,
-      isClosed: true,
-    });
-  }
-  // Add 30th candle as a strong lower wick rejection at support
-  mockCandles.push({
-    asset: 'EURUSD',
-    timeframe: 300,
-    openTime: baseTime + 29 * 300000,
-    open: 1.0558,
-    high: 1.0560,
-    low: 1.0520, // 40-pip dip
-    close: 1.0556, // recovered -> 90% lower wick
-    isClosed: true,
-  });
 
-  const signal = engine.evaluateSetup('EURUSD', false, mockCandles, 85, Date.now());
-  if (!signal || signal.direction !== 'CALL') {
-    throw new Error(`Signal engine failed to generate expected CALL signal: ${JSON.stringify(signal)}`);
+  // Test 6: dip in an uptrend -> CALL, 5 minutes, all three indicators cited
+  const callCandles = pullbackSeries(1);
+  const callSignal = engine.evaluateSetup('EURUSD', false, callCandles, 85, Date.now());
+  if (!callSignal || callSignal.direction !== 'CALL') {
+    throw new Error(`Expected a CALL on a dip in an uptrend: ${JSON.stringify(callSignal)}`);
   }
-  if (signal.confidence < 70) {
-    throw new Error(`Signal confidence too low: ${signal.confidence}%`);
+  if (callSignal.expiryMinutes !== 5 || callSignal.expiryTime - callSignal.entryTime !== 300000) {
+    throw new Error('Signal must state a 5-minute expiry');
   }
-  console.log(`✓ Signal Engine generated CALL signal with ${signal.confidence}% confidence`);
-  console.log(`  Reasons: ${signal.reasons.join(' | ')}`);
+  const text = callSignal.reasons.join(' ');
+  if (!/EMA/.test(text) || !/RSI/.test(text) || !/Stochastic/.test(text)) {
+    throw new Error(`Signal must cite EMA, RSI and Stochastic: ${text}`);
+  }
+  console.log(`✓ CALL signal on a dip in an uptrend (score ${callSignal.confidence}, ${callSignal.expiryMinutes} min)`);
+  console.log(`  Reasons: ${callSignal.reasons.join(' | ')}`);
 
-  // Test 6: Low payout filter (<80% payout should reject)
-  const lowPayoutSignal = engine.evaluateSetup('EURUSD', false, mockCandles, 70, Date.now());
-  if (lowPayoutSignal !== null) {
+  // Test 7: mirror image -> PUT
+  const putSignal = engine.evaluateSetup('EURUSD', false, pullbackSeries(-1), 85, Date.now());
+  if (!putSignal || putSignal.direction !== 'PUT') {
+    throw new Error(`Expected a PUT on a bounce in a downtrend: ${JSON.stringify(putSignal)}`);
+  }
+  console.log(`✓ PUT signal on a bounce in a downtrend (score ${putSignal.confidence})`);
+
+  // Test 8: no signal when the rules do not line up
+  const calm = candlesFromCloses(Array.from({ length: 40 }, () => 1.05));
+  if (engine.evaluateSetup('EURUSD', false, calm, 85, Date.now()) !== null) throw new Error('Flat market must give no signal');
+  const steady = candlesFromCloses(Array.from({ length: 50 }, (_, i) => 1.05 + i * 0.0005));
+  if (engine.evaluateSetup('EURUSD', false, steady, 85, Date.now()) !== null) throw new Error('A trend with no pullback must give no signal');
+  // Same dip, but one candle too early (Stochastic has not crossed yet) -> must wait
+  const early = pullbackSeries(1).slice(0, -2);
+  const earlySignal = engine.evaluateSetup('EURUSD', false, early, 85, Date.now());
+  if (earlySignal && earlySignal.direction === 'CALL') throw new Error('Must wait for the Stochastic cross before signalling');
+  // A dip that is far too short to matter must not trigger either
+  if (engine.evaluateSetup('EURUSD', false, pullbackSeries(1).slice(0, 10), 85, Date.now()) !== null) throw new Error('Too little data must give no signal');
+  console.log('✓ No signal in flat markets, trends without a pullback, or before the Stochastic cross');
+
+  // Test 9: Low payout filter (<80% payout should reject)
+  if (engine.evaluateSetup('EURUSD', false, callCandles, 70, Date.now()) !== null) {
     throw new Error('Signal engine should reject trades with payout < 80%');
   }
   console.log('✓ Low payout filter passed (rejected 70% payout)');

@@ -13,6 +13,7 @@ async function testPrompt() {
     isOtc: false,
     direction: 'CALL',
     timeframeSeconds: 300,
+    expiryMinutes: 5,
     entryTime: now + 15000,
     expiryTime: now + 15000 + 300000,
     confidence: 82,

@@ -6,6 +6,7 @@ import { QxWsSniffer } from './stream/wsSniffer.js';
 import { CandleAggregator } from './stream/candleAggregator.js';
 import { TechnicalIndicators } from './analysis/indicators.js';
 import { SignalEngine } from './analysis/signalEngine.js';
+import { pullbackSeries } from './analysis/testSeries.js';
 import { TradingJournalDB } from './journal/database.js';
 import { JournalAnalytics } from './journal/analytics.js';
 import { playAlertSound } from './ui/sound.js';
@@ -127,40 +128,16 @@ async function runFullDiagnostics() {
   const wick = TechnicalIndicators.analyzeCandleWicks(hammer);
   record('Indicators', 'Candle Rejection Wick Analysis', wick.lowerWickRatio >= 0.70, `Lower wick ratio: ${(wick.lowerWickRatio * 100).toFixed(0)}%`);
 
-  // Test Signal Engine CALL detection
+  // Test Signal Engine CALL detection (EMA trend + RSI momentum + Stochastic timing)
   const engine = new SignalEngine();
-  const mockHistory: Candle[] = [];
-  for (let i = 0; i < 29; i++) {
-    const p = 1.0500 + i * 0.0002;
-    mockHistory.push({
-      asset: 'EURUSD',
-      timeframe: 300,
-      openTime: Date.now() - (30 - i) * 300000,
-      open: p,
-      high: p + 0.0002,
-      low: p - 0.0001,
-      close: p + 0.0001,
-      isClosed: true,
-    });
-  }
-  // 30th candle: hammer rejection at lower band
-  mockHistory.push({
-    asset: 'EURUSD',
-    timeframe: 300,
-    openTime: Date.now() - 300000,
-    open: 1.0555,
-    high: 1.0557,
-    low: 1.0515,
-    close: 1.0553,
-    isClosed: true,
-  });
+  const mockHistory = pullbackSeries(1);
 
   const signal = engine.evaluateSetup('EURUSD', false, mockHistory, 85, Date.now() + 300000);
   record(
     'SignalEngine',
-    'Confluence CALL Signal Generation',
-    Boolean(signal && signal.direction === 'CALL' && signal.confidence >= 70),
-    `Confidence: ${signal?.confidence}%, Reasons: ${signal?.reasons.length}`
+    'EMA + RSI + Stochastic CALL Signal Generation',
+    Boolean(signal && signal.direction === 'CALL' && signal.expiryMinutes === 5),
+    `Score: ${signal?.confidence}, Reasons: ${signal?.reasons.length}, Expiry: ${signal?.expiryMinutes} min`
   );
 
   // Test Negative EV Filter (Payout < 80% must be rejected)
