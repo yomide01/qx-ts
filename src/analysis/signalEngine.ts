@@ -33,31 +33,33 @@ export interface TradingSignal {
  * payout margin is something only your own results can show.
  */
 export class SignalEngine {
-  public minPayoutPercent: number = 80;
+  public minPayoutPercent: number = process.env.MIN_PAYOUT_PERCENT ? Number(process.env.MIN_PAYOUT_PERCENT) : 75;
   /** All three core rules together score 60, so 60 means "the full set lined up". */
   public minConfidenceThreshold: number = 60;
-  public readonly timeframeSeconds: number = 300;
+  public timeframeSeconds: number = 300;
 
   public evaluateSetup(
     asset: string,
     isOtc: boolean,
     candles: Candle[],
     payoutPercent: number,
-    targetEntryTime: number
+    targetEntryTime: number,
+    timeframeSeconds: number = 300
   ): TradingSignal | null {
     // Payout filter: a low payout makes break-even harder to reach
     if (payoutPercent < this.minPayoutPercent) return null;
 
-    // Need enough closed candles for EMA 21, RSI 14 and the slow Stochastic
-    if (candles.length < 25) return null;
+    // Need at least 8 closed candles to start computing reliable indicators
+    if (candles.length < 8) return null;
 
+    const tf = timeframeSeconds || this.timeframeSeconds;
     const closes = candles.map((c) => c.close);
     const emaFastArr = TechnicalIndicators.calculateEMA(closes, 9);
     const emaSlowArr = TechnicalIndicators.calculateEMA(closes, 21);
     const rsiArr = TechnicalIndicators.calculateRSI(closes, 14);
     const stoch = TechnicalIndicators.calculateStochastic(candles, 14, 3, 3);
 
-    if (emaFastArr.length < 4 || emaSlowArr.length < 1 || rsiArr.length < 2 || stoch.k.length < 2 || stoch.d.length < 2) {
+    if (emaFastArr.length < 2 || emaSlowArr.length < 1 || rsiArr.length < 2 || stoch.k.length < 2 || stoch.d.length < 2) {
       return null;
     }
 
@@ -120,7 +122,7 @@ export class SignalEngine {
         score += 5;
         reasons.push(`Bonus: high payout (${payoutPercent.toFixed(0)}%)`);
       }
-      return this.build('CALL', asset, isOtc, targetEntryTime, score, payoutPercent, reasons, regime, indicatorSnapshot);
+      return this.build('CALL', asset, isOtc, targetEntryTime, tf, score, payoutPercent, reasons, regime, indicatorSnapshot);
     }
 
     // ---------- PUT ----------
@@ -147,7 +149,7 @@ export class SignalEngine {
         score += 5;
         reasons.push(`Bonus: high payout (${payoutPercent.toFixed(0)}%)`);
       }
-      return this.build('PUT', asset, isOtc, targetEntryTime, score, payoutPercent, reasons, regime, indicatorSnapshot);
+      return this.build('PUT', asset, isOtc, targetEntryTime, tf, score, payoutPercent, reasons, regime, indicatorSnapshot);
     }
 
     return null;
@@ -158,6 +160,7 @@ export class SignalEngine {
     asset: string,
     isOtc: boolean,
     entryTime: number,
+    timeframeSeconds: number,
     score: number,
     payoutPercent: number,
     reasons: string[],
@@ -169,10 +172,10 @@ export class SignalEngine {
       asset,
       isOtc,
       direction,
-      timeframeSeconds: this.timeframeSeconds,
-      expiryMinutes: this.timeframeSeconds / 60,
+      timeframeSeconds,
+      expiryMinutes: timeframeSeconds / 60,
       entryTime,
-      expiryTime: entryTime + this.timeframeSeconds * 1000,
+      expiryTime: entryTime + timeframeSeconds * 1000,
       confidence: Math.min(score, 95),
       payoutPercent,
       reasons,

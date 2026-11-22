@@ -12,8 +12,9 @@ export class CandleAggregator extends EventEmitter {
   // Key format: `${asset}_${timeframeSeconds}`
   private activeCandles: Map<string, Candle> = new Map();
   private candleHistory: Map<string, Candle[]> = new Map();
-  private supportedTimeframes: number[] = [60, 300]; // 1-minute (M1) and 5-minute (M5)
+  private supportedTimeframes: number[] = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
   private maxHistorySize: number = 100;
+  private lastSeededLog: Map<string, number> = new Map();
 
   constructor(private sniffer: QxWsSniffer) {
     super();
@@ -125,17 +126,57 @@ export class CandleAggregator extends EventEmitter {
         active.isClosed = false;
         this.activeCandles.set(key, active);
         this.candleHistory.set(key, candles.slice(-this.maxHistorySize));
-        console.log(`[CandleAggregator] Seeded ${candles.length} closed ${tf === 60 ? 'M1' : tf === 300 ? 'M5' : tf + 's'} candles for ${cleanAsset}. Ready!`);
+
+        // Debounce log to once every 30 seconds per key to prevent terminal log flooding
+        const lastLog = this.lastSeededLog.get(key) || 0;
+        if (Date.now() - lastLog > 30000) {
+          this.lastSeededLog.set(key, Date.now());
+          const tfName = tf === 60 ? 'M1' : tf === 300 ? 'M5' : `${tf}s`;
+          console.log(`[CandleAggregator] Seeded ${candles.length} closed ${tfName} candles for ${cleanAsset}. Ready!`);
+        }
       }
     }
   }
 
   /**
-   * Returns closed candles for an asset and timeframe (chronological order)
+   * Returns closed candles for an asset and timeframe (chronological order).
+   * If target timeframe has fewer than 8 candles, attempts to synthesize from sub-period (e.g. M1 -> M5).
    */
   public getHistory(asset: string, timeframeSeconds: number): Candle[] {
     const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
-    return this.candleHistory.get(key) || [];
+    const direct = this.candleHistory.get(key);
+    if (direct && direct.length >= 8) return direct;
+
+    // Synthesize higher timeframe candles from M1 (60s) if available
+    if (timeframeSeconds > 60 && timeframeSeconds % 60 === 0) {
+      const m1Key = `${normalizeAsset(asset)}_60`;
+      const m1Candles = this.candleHistory.get(m1Key) || [];
+      const ratio = timeframeSeconds / 60;
+      if (m1Candles.length >= ratio) {
+        const synthesized: Candle[] = [];
+        const groupCount = Math.floor(m1Candles.length / ratio);
+        for (let g = 0; g < groupCount; g++) {
+          const slice = m1Candles.slice(g * ratio, (g + 1) * ratio);
+          if (slice.length === ratio) {
+            synthesized.push({
+              asset: slice[0].asset,
+              timeframe: timeframeSeconds,
+              openTime: slice[0].openTime,
+              open: slice[0].open,
+              high: Math.max(...slice.map((c) => c.high)),
+              low: Math.min(...slice.map((c) => c.low)),
+              close: slice[slice.length - 1].close,
+              isClosed: true,
+            });
+          }
+        }
+        if (synthesized.length > (direct?.length || 0)) {
+          return synthesized;
+        }
+      }
+    }
+
+    return direct || [];
   }
 
   /**

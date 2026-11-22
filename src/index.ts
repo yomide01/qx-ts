@@ -9,7 +9,6 @@ import { TradingSignal } from './analysis/signalEngine.js';
 import { TechnicalIndicators } from './analysis/indicators.js';
 import { normalizeAsset } from './stream/assets.js';
 import { StatusLine, installCleanConsole } from './ui/statusLine.js';
-import { analyzePriceStructure } from './analysis/marketQuality.js';
 
 async function bootstrap() {
   // One tidy live status line; other messages never get glued onto it
@@ -46,11 +45,20 @@ async function bootstrap() {
 
   // Tell the user whenever the market on the chart changes
   sniffer.on('activeAssetChanged', ({ asset, previous }: { asset: string; previous: string | null }) => {
-    const have = aggregator.getHistory(asset, 300).length;
+    const tf = sniffer.getActiveTimeframe();
+    const have = aggregator.getHistory(asset, tf).length;
+    const tfLabel = tf >= 60 ? `M${tf / 60}` : `${tf}s`;
     console.log(
-      `\n[Market] Now analysing ${asset}${previous ? ` (was ${previous})` : ''}. ` +
-        `M5 candles ready: ${have}/25${have < 25 ? ' - warming up, signals start once 25 are collected' : ''}`
+      `\n[Market] Now analysing ${asset}${previous ? ` (was ${previous})` : ''} on ${tfLabel} timeframe. ` +
+        `Candles ready: ${have}${have < 8 ? ' (warming up indicators, ready shortly)' : ' (active)'}`
     );
+  });
+
+  // Tell the user whenever the timeframe on the chart changes
+  sniffer.on('timeframeChanged', ({ timeframe, previous }: { timeframe: number; previous: number }) => {
+    const tfLabel = timeframe >= 60 ? `M${timeframe / 60}` : `${timeframe}s`;
+    const prevLabel = previous >= 60 ? `M${previous / 60}` : `${previous}s`;
+    console.log(`\n[Timeframe] Chart timeframe changed from ${prevLabel} to ${tfLabel}. Adapting analysis cycle.`);
   });
 
   // Tell the user whenever the account changes (this is the safety-critical one)
@@ -68,22 +76,26 @@ async function bootstrap() {
   let lastPayoutLogAt = 0;
   sniffer.on('payouts', (payouts: any[]) => {
     if (Date.now() - lastPayoutLogAt < 60000) return;
+    const activeAsset = sniffer.getActiveAsset();
+    const isOtc = activeAsset ? activeAsset.endsWith('_OTC') : true;
     const top = payouts
-      .filter((p: any) => p.payoutPercent >= 80)
+      .filter((p: any) => p.payoutPercent >= 75 && p.isActive && (isOtc ? p.isOtc : true))
       .slice(0, 4)
       .map((p: any) => `${p.asset}: ${p.payoutPercent}%`)
       .join(' | ');
     if (top) {
       lastPayoutLogAt = Date.now();
-      console.log(`[Payouts] Available High-Payout Pairs: ${top}`);
+      console.log(`\n[Payouts] Available High-Payout Pairs: ${top}`);
     }
   });
 
-  // Notify when a 5M candle closes
+  // Notify when a candle closes on the active timeframe
   aggregator.on('candleClosed', (candle: any) => {
-    if (candle.timeframe === 300) {
+    const activeTf = sniffer.getActiveTimeframe();
+    if (candle.timeframe === activeTf) {
+      const tfName = activeTf >= 60 ? `M${activeTf / 60}` : `${activeTf}s`;
       console.log(
-        `\n[M5 Candle Closed] ${candle.asset} | Open: ${candle.open} | High: ${candle.high} | Low: ${candle.low} | Close: ${candle.close}`
+        `\n[${tfName} Candle Closed] ${candle.asset} | Open: ${candle.open} | High: ${candle.high} | Low: ${candle.low} | Close: ${candle.close}`
       );
     }
   });
@@ -131,13 +143,14 @@ async function bootstrap() {
   let waitingSince = 0;
   let hintShown = false;
 
-  // Active Real-Time Market Analysis Heartbeat (Updates every 3 seconds)
+  // Active Real-Time Market Analysis Heartbeat (Updates every 2 seconds)
   setInterval(() => {
+    const activeTf = sniffer.getActiveTimeframe() || 300;
+    const tfLabel = activeTf >= 60 ? `M${activeTf / 60}` : `${activeTf}s`;
     const now = Date.now();
-    const cycleMs = 300 * 1000;
+    const cycleMs = activeTf * 1000;
     const nextCandleOpen = Math.ceil(now / cycleMs) * cycleMs;
     const remainingSec = Math.max(0, Math.round((nextCandleOpen - now) / 1000));
-    const elapsedSec = 300 - remainingSec;
     const minStr = Math.floor(remainingSec / 60)
       .toString()
       .padStart(2, '0');
@@ -145,13 +158,15 @@ async function bootstrap() {
 
     const activeAsset = sniffer.getActiveAsset();
     const mode = sniffer.getAccountMode();
-    const modeStr = mode === 'LIVE' ? 'LIVE!' : mode === 'DEMO' ? 'demo' : '??';
+    const balanceInfo = sniffer.getBalance();
+    const balFormatted = balanceInfo ? `$${balanceInfo.balance.toFixed(2)}` : '$0.00';
+    const modeStr = mode === 'LIVE' ? `LIVE: ${balFormatted}` : mode === 'DEMO' ? `demo: ${balFormatted}` : `??: ${balFormatted}`;
 
     if (sniffer.totalTicksReceived > 0 && activeAsset) {
       const latestTick = sniffer.getLatestTick(activeAsset);
       const payout = sniffer.getPayout(activeAsset);
-      const history = aggregator.getHistory(activeAsset, 300);
-      const currentCandle = aggregator.getCurrentCandle(activeAsset, 300);
+      const history = aggregator.getHistory(activeAsset, activeTf);
+      const currentCandle = aggregator.getCurrentCandle(activeAsset, activeTf);
 
       const closes = history.map((c) => c.close);
       if (currentCandle) closes.push(currentCandle.close);
@@ -159,48 +174,69 @@ async function bootstrap() {
       let rsiStr = '--';
       let stochStr = '--';
       let trendStr = 'RANGING';
+      let predictionStr = 'ANALYZING';
 
-      if (closes.length >= 21) {
-        const emaFast = TechnicalIndicators.calculateEMA(closes, 9);
-        const emaSlow = TechnicalIndicators.calculateEMA(closes, 21);
-        const rsi = TechnicalIndicators.calculateRSI(closes, 14);
+      if (closes.length >= 6) {
+        const emaFast = TechnicalIndicators.calculateEMA(closes, Math.min(9, closes.length));
+        const emaSlow = TechnicalIndicators.calculateEMA(closes, Math.min(21, closes.length));
+        const rsi = TechnicalIndicators.calculateRSI(closes, Math.min(14, closes.length));
 
         const ef = emaFast[emaFast.length - 1];
         const es = emaSlow[emaSlow.length - 1];
         const r = rsi[rsi.length - 1];
 
-        rsiStr = r ? r.toFixed(1) : '--';
-        const st = TechnicalIndicators.calculateStochastic(history.concat(currentCandle ? [currentCandle] : []), 14, 3, 3);
-        if (st.k.length > 0) stochStr = st.k[st.k.length - 1].toFixed(0);
-        trendStr = ef > es ? 'UPTREND' : ef < es ? 'DOWNTREND' : 'RANGING';
-      }
+        rsiStr = r !== undefined ? r.toFixed(1) : '--';
+        const st = TechnicalIndicators.calculateStochastic(
+          history.concat(currentCandle ? [currentCandle] : []),
+          Math.min(14, closes.length),
+          3,
+          3
+        );
+        const kVal = st.k.length > 0 ? st.k[st.k.length - 1] : undefined;
+        const dVal = st.d.length > 0 ? st.d[st.d.length - 1] : undefined;
+        if (kVal !== undefined) stochStr = kVal.toFixed(0);
 
-      const structure = analyzePriceStructure(closes, payout?.payoutPercent ?? 85);
-      const structureStr =
-        structure.verdict === 'INSUFFICIENT_DATA'
-          ? `warming up ${history.length}/25`
-          : structure.verdict === 'RANDOM_WALK_LIKE'
-            ? 'coin-flip-like'
-            : 'some pattern';
+        if (ef !== undefined && es !== undefined) {
+          trendStr = ef > es ? 'UPTREND' : ef < es ? 'DOWNTREND' : 'RANGING';
+        }
+
+        // Live directional prediction (calls out UP / DOWN direction for active candle/expiry)
+        if (r !== undefined && kVal !== undefined && dVal !== undefined && ef !== undefined && es !== undefined) {
+          if (ef > es && r > 48 && kVal < 80 && kVal > dVal) {
+            predictionStr = 'CALL (UP) ⬆';
+          } else if (ef < es && r < 52 && kVal > 20 && kVal < dVal) {
+            predictionStr = 'PUT (DOWN) ⬇';
+          } else if (r > 68 || kVal > 85) {
+            predictionStr = 'OVERBOUGHT (Watch PUT)';
+          } else if (r < 32 || kVal < 15) {
+            predictionStr = 'OVERSOLD (Watch CALL)';
+          } else if (ef > es) {
+            predictionStr = 'BULLISH BIAS ↗';
+          } else if (ef < es) {
+            predictionStr = 'BEARISH BIAS ↘';
+          } else {
+            predictionStr = 'CONSOLIDATING ↔';
+          }
+        }
+      }
 
       waitingSince = 0;
       status.show(
         `[${modeStr}] ${activeAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
           payout?.payoutPercent || '--'
-        }%) | Next M5: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Stoch ${stochStr} | Structure: ${structureStr} | Ticks: ${
+        }%) | Next ${tfLabel}: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Stoch ${stochStr} | Prediction: ${predictionStr} | Ticks: ${
           sniffer.totalTicksReceived
         }`
       );
     } else {
-      const accountLabel = mode === 'LIVE' ? 'LIVE ACCOUNT' : mode === 'DEMO' ? 'DEMO' : 'account ?';
+      const accountLabel = mode === 'LIVE' ? `LIVE (${balFormatted})` : mode === 'DEMO' ? `DEMO (${balFormatted})` : 'connecting';
       const frames = sniffer.totalFramesReceived;
       if (frames === 0) {
-        status.show(`[${accountLabel}] Connecting to Quotex... no data yet | Next 5M candle: ${minStr}:${secStr}`);
+        status.show(`[${accountLabel}] Connecting to Quotex... no data yet | Next ${tfLabel}: ${minStr}:${secStr}`);
       } else {
         status.show(
-          `[${accountLabel}] Connected (${frames} messages, ${sniffer.getAllPayouts().length} markets) - waiting for a chart | Next 5M candle: ${minStr}:${secStr}`
+          `[${accountLabel}] Connected (${frames} msgs, ${sniffer.getAllPayouts().length} markets) - awaiting chart | Next ${tfLabel}: ${minStr}:${secStr}`
         );
-        // Data is flowing but no prices: almost always the chart has not finished loading
         if (waitingSince === 0) waitingSince = Date.now();
         if (!hintShown && Date.now() - waitingSince > 90000) {
           hintShown = true;

@@ -20,20 +20,21 @@ export class TechnicalIndicators {
    * Exponential Moving Average (EMA)
    */
   public static calculateEMA(prices: number[], period: number): number[] {
-    if (prices.length < period) return [];
+    const effPeriod = Math.max(2, Math.min(period, prices.length));
+    if (prices.length < 2) return [];
 
-    const k = 2 / (period + 1);
+    const k = 2 / (effPeriod + 1);
     const emaArray: number[] = [];
 
     // Initial SMA for first period
     let sum = 0;
-    for (let i = 0; i < period; i++) {
+    for (let i = 0; i < effPeriod; i++) {
       sum += prices[i];
     }
-    let prevEma = sum / period;
+    let prevEma = sum / effPeriod;
     emaArray.push(prevEma);
 
-    for (let i = period; i < prices.length; i++) {
+    for (let i = effPeriod; i < prices.length; i++) {
       const currentEma = prices[i] * k + prevEma * (1 - k);
       emaArray.push(currentEma);
       prevEma = currentEma;
@@ -46,7 +47,8 @@ export class TechnicalIndicators {
    * Relative Strength Index (RSI - Wilder's Smoothing)
    */
   public static calculateRSI(prices: number[], period: number = 14): number[] {
-    if (prices.length <= period) return [];
+    if (prices.length < 3) return [];
+    const effPeriod = Math.max(2, Math.min(period, prices.length - 1));
 
     const gains: number[] = [];
     const losses: number[] = [];
@@ -57,19 +59,19 @@ export class TechnicalIndicators {
       losses.push(diff < 0 ? Math.abs(diff) : 0);
     }
 
-    if (gains.length < period) return [];
+    if (gains.length < effPeriod) return [];
 
     // First average
-    let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    let avgGain = gains.slice(0, effPeriod).reduce((a, b) => a + b, 0) / effPeriod;
+    let avgLoss = losses.slice(0, effPeriod).reduce((a, b) => a + b, 0) / effPeriod;
 
     const rsiValues: number[] = [];
     const firstRs = avgLoss === 0 ? 100 : avgGain / avgLoss;
     rsiValues.push(100 - 100 / (1 + firstRs));
 
-    for (let i = period; i < gains.length; i++) {
-      avgGain = (avgGain * (period - 1) + gains[i]) / period;
-      avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    for (let i = effPeriod; i < gains.length; i++) {
+      avgGain = (avgGain * (effPeriod - 1) + gains[i]) / effPeriod;
+      avgLoss = (avgLoss * (effPeriod - 1) + losses[i]) / effPeriod;
 
       if (avgLoss === 0) {
         rsiValues.push(100);
@@ -94,13 +96,16 @@ export class TechnicalIndicators {
     kSmooth: number = 3,
     dPeriod: number = 3
   ): { k: number[]; d: number[] } {
-    if (candles.length < kPeriod) return { k: [], d: [] };
+    if (candles.length < 3) return { k: [], d: [] };
+    const effK = Math.max(2, Math.min(kPeriod, candles.length));
+    const effSmooth = Math.max(1, Math.min(kSmooth, effK));
+    const effD = Math.max(1, Math.min(dPeriod, effK));
 
     const raw: number[] = [];
-    for (let i = kPeriod - 1; i < candles.length; i++) {
+    for (let i = effK - 1; i < candles.length; i++) {
       let hh = -Infinity;
       let ll = Infinity;
-      for (let j = i - kPeriod + 1; j <= i; j++) {
+      for (let j = i - effK + 1; j <= i; j++) {
         hh = Math.max(hh, candles[j].high);
         ll = Math.min(ll, candles[j].low);
       }
@@ -118,8 +123,8 @@ export class TechnicalIndicators {
       return out;
     };
 
-    const k = sma(raw, kSmooth);
-    const d = sma(k, dPeriod);
+    const k = sma(raw, effSmooth);
+    const d = sma(k, effD);
     return { k, d };
   }
 

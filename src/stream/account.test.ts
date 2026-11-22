@@ -97,5 +97,24 @@ assert.equal(payouts[0].payout5mPercent, 84);
 assert.equal(payouts[1].payoutPercent, 86, 'falls back to the general payout when no 5-minute figure');
 console.log('✓ 5-minute payout is used (falls back to general payout)');
 
+// 9. On-screen active tab / deal form payout overrides WebSocket stream data
+const s3 = new QxWsSniffer();
+// Simulate on-screen DOM scraper detecting 89% from active tab / deal form
+s3.setOnScreenPayout('EURUSD_OTC', 89);
+assert.equal(s3.getPayout('EURUSD_OTC')?.payoutPercent, 89);
+
+// Incoming WebSocket frame delivers standard instruments array with 91%
+const rawInstrumentsWs = JSON.stringify([
+  row('EURUSD_otc', 'EUR/USD (OTC)', 91, 91, 91),
+  row('USDJPY_otc', 'USD/JPY (OTC)', 82, 82, 82),
+]);
+s3.handleIncomingFrame(`42["instruments",${rawInstrumentsWs}]`);
+
+// Confirm EURUSD_OTC is NOT overridden to 91% and remains authoritative 89%
+assert.equal(s3.getPayout('EURUSD_OTC')?.payoutPercent, 89, 'On-screen 89% must override WebSocket 91%');
+// Confirm other assets without on-screen overrides still take their WS payouts
+assert.equal(s3.getPayout('USDJPY_OTC')?.payoutPercent, 82);
+console.log('✓ On-screen payout (e.g. 89%) overrides WebSocket stream data (91%)');
+
 console.log('\nAll account tests passed.');
 process.exit(0);

@@ -13,6 +13,7 @@ export interface QxWsSnifferEvents {
   raw: (msg: ParsedWsMessage) => void;
   activeAssetChanged: (info: { asset: string; previous: string | null }) => void;
   accountChanged: (info: { mode: AccountMode; previous: AccountMode; source: string }) => void;
+  timeframeChanged: (info: { timeframe: number; previous: number }) => void;
 }
 
 /** Works out DEMO / LIVE from a Quotex page address (/demo-trade = demo, /trade = live). */
@@ -34,6 +35,7 @@ export class QxWsSniffer extends EventEmitter {
   private latestTicks: Map<string, Tick> = new Map();
   private lastTickAt: Map<string, number> = new Map();
   private assetPayouts: Map<string, AssetPayout> = new Map();
+  private onScreenPayouts: Map<string, { payout: number; at: number }> = new Map();
   private registry = new AssetRegistry();
   private currentBalance: AccountBalance | null = null;
 
@@ -41,6 +43,10 @@ export class QxWsSniffer extends EventEmitter {
   private domAsset: { asset: string; at: number } | null = null;
   private lastTickAsset: string | null = null;
   private activeAsset: string | null = null;
+
+  // ── Timeframe & Expiry on chart ──
+  private activeTimeframe: number = 300; // default 5m
+  private activeExpiry: number = 60; // default 1m
 
   // ── Which account (demo / live) is open right now ──
   // Clues: the page address, the account/change + authorization messages the page sends,
@@ -117,8 +123,8 @@ export class QxWsSniffer extends EventEmitter {
     this.setUrlMode(accountModeFromUrl(page.url()));
 
     // Layer 3: Passive DOM poller. Reads what you can SEE on screen: which market is on the
-    // chart, its price/payout, the account label and the balance. Runs every 1.5s so a switch
-    // of market or account is picked up quickly.
+    // chart, its real price/payout, timeframe, account label and balance. Runs every 1.5s so
+    // any switch is picked up immediately.
     setInterval(async () => {
       try {
         if (page.isClosed()) return;
@@ -149,45 +155,124 @@ export class QxWsSniffer extends EventEmitter {
             '[class*="quote__value"]',
             '.price-value',
           ]);
-          const payoutEl = first([
-            '[class*="payout-percent"]',
-            '[class*="profit-percent"]',
-            '[class*="deal-form__payout"]',
-            '.payout-value',
-          ]);
 
-          // Account label: look only at SHORT texts inside account/balance widgets, so the
-          // word "Demo" appearing somewhere else on the page cannot fool us.
+          // Exact on-screen Payout (from active tab, deal form, or payout elements)
+          let payoutNum: number | null = null;
+          const activeTabEl = document.querySelector('.tab-item--active, [class*="tab--active"]');
+          if (activeTabEl && activeTabEl.textContent) {
+            const m = activeTabEl.textContent.match(/(\d{1,3})%/);
+            if (m) payoutNum = parseInt(m[1], 10);
+          }
+          if (!payoutNum) {
+            const dealFormEl = document.querySelector('[class*="deal-form"], [class*="sidebar"]');
+            if (dealFormEl && dealFormEl.textContent) {
+              const m = dealFormEl.textContent.match(/(\d{1,3})%/);
+              if (m) payoutNum = parseInt(m[1], 10);
+            }
+          }
+          if (!payoutNum) {
+            const pEl = first([
+              '[class*="payout-percent"]',
+              '[class*="profit-percent"]',
+              '[class*="deal-form__payout"]',
+              '.payout-value',
+            ]);
+            if (pEl && pEl.textContent) {
+              const m = pEl.textContent.match(/(\d{1,3})/);
+              if (m) payoutNum = parseInt(m[1], 10);
+            }
+          }
+
+          // Candle timeframe from left toolbar / chart header (e.g. 5m, 1m, 30s, 10s, 1h)
+          let chartTfSec = 300;
+          const tfButtons = Array.from(document.querySelectorAll('button, [class*="timeframe"], .chart-sidebar button, .chart-top-panel button'));
+          for (const btn of tfButtons) {
+            const t = (btn.textContent || '').trim().toLowerCase();
+            const match = t.match(/^(5s|10s|15s|30s|1m|2m|5m|10m|15m|30m|1h|4h|1d)$/);
+            if (match) {
+              const isSelected = btn.classList.contains('active') || btn.classList.contains('selected') || btn.getAttribute('aria-selected') === 'true';
+              if (isSelected) {
+                const val = parseInt(match[1].slice(0, -1), 10);
+                const unit = match[1].slice(-1);
+                chartTfSec = unit === 's' ? val : unit === 'm' ? val * 60 : unit === 'h' ? val * 3600 : val * 86400;
+                break;
+              }
+            }
+          }
+
+          // Trade expiry duration from deal form (e.g. "00:01:00" -> 60s)
+          let expirySec = 60;
+          const timeInputs = Array.from(document.querySelectorAll('[class*="deal-form"] input, [class*="deal-form"] [class*="time"]'));
+          for (const el of timeInputs) {
+            const val = (el as HTMLInputElement).value || el.textContent || '';
+            const match = val.match(/(\d{2}):(\d{2}):(\d{2})/);
+            if (match) {
+              const hrs = parseInt(match[1], 10);
+              const mins = parseInt(match[2], 10);
+              const secs = parseInt(match[3], 10);
+              const total = hrs * 3600 + mins * 60 + secs;
+              if (total > 0) {
+                expirySec = total;
+                break;
+              }
+            }
+          }
+
+          // Account label & exact balance from header
           const labelTexts = Array.from(document.querySelectorAll('[class*="account"], [class*="balance"], header'))
             .map((el) => (el.textContent || '').replace(/\s+/g, ' ').trim())
-            .filter((t) => t.length > 0 && t.length < 80);
+            .filter((t) => t.length > 0 && t.length < 100);
           const joined = labelTexts.join(' | ');
           const sawDemo = /demo|practice/i.test(joined);
           const sawLive = /live account|real account|\blive\b/i.test(joined);
 
-          const balanceEl = first(['[class*="balance"] [class*="value"]', '[class*="balance__value"]', '[class*="balance"]']);
-          const balanceMatch = (text(balanceEl) || '').match(/([\d.,]+)/);
+          let balanceMatch: string | null = null;
+          const headerEl = document.querySelector('header, [class*="header"], [class*="usermenu"]');
+          if (headerEl) {
+            const hText = headerEl.textContent || '';
+            const m = hText.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+            if (m) balanceMatch = m[1];
+          }
+          if (!balanceMatch) {
+            const balanceEl = first(['[class*="balance"] [class*="value"]', '[class*="balance__value"]', '[class*="balance"]']);
+            const m = (text(balanceEl) || '').match(/([\d.,]+)/);
+            if (m) balanceMatch = m[1];
+          }
 
           return {
             url: window.location.href,
             symbol: text(symbolEl),
             price: text(priceEl),
-            payout: text(payoutEl),
-            balance: balanceMatch ? balanceMatch[1] : null,
+            payout: payoutNum,
+            chartTfSec,
+            expirySec,
+            balance: balanceMatch,
             labelMode: sawDemo && !sawLive ? 'DEMO' : sawLive && !sawDemo ? 'LIVE' : 'UNKNOWN',
           };
         });
 
-        // ── Account ──
+        // ── Account & Balance ──
         this.setUrlMode(accountModeFromUrl(dom.url));
         this.tracker.update('screen label', dom.labelMode as AccountMode);
         this.refreshAccountMode();
 
-        // The on-screen balance is only a fallback for when Quotex's own balance message has
-        // not been seen (that one is exact and carries both accounts).
-        if (dom.balance && this.liveBalanceValue === null && this.demoBalanceValue === null) {
+        if (dom.balance) {
           const balNum = parseFloat(dom.balance.replace(/,/g, ''));
-          if (!isNaN(balNum)) this.updateBalance(balNum, 'USD');
+          if (!isNaN(balNum)) {
+            if (this.accountMode === 'LIVE') this.liveBalanceValue = balNum;
+            else if (this.accountMode === 'DEMO') this.demoBalanceValue = balNum;
+            this.updateBalance(balNum, 'USD');
+          }
+        }
+
+        // ── Timeframe & Expiry ──
+        if (dom.chartTfSec && dom.chartTfSec !== this.activeTimeframe) {
+          const prevTf = this.activeTimeframe;
+          this.activeTimeframe = dom.chartTfSec;
+          this.emit('timeframeChanged', { timeframe: this.activeTimeframe, previous: prevTf });
+        }
+        if (dom.expirySec) {
+          this.activeExpiry = dom.expirySec;
         }
 
         // ── Market on chart ──
@@ -198,7 +283,6 @@ export class QxWsSniffer extends EventEmitter {
         if (resolved && (this.registry.isKnown(resolved) || this.latestTicks.has(resolved))) {
           screenAsset = resolved;
         } else if (!isNaN(priceNum) && priceNum > 0) {
-          // Name not recognised: find the market whose live price matches the chart price.
           screenAsset = this.matchAssetByPrice(priceNum);
         }
         if (screenAsset) {
@@ -206,25 +290,29 @@ export class QxWsSniffer extends EventEmitter {
         }
         this.refreshActiveAsset();
 
-        // Only fall back to screen-scraped prices if the data stream has gone quiet for this
-        // market. Mixing both sources is what used to corrupt the candles.
+        // ── Authoritative On-Screen Payout ──
+        if (screenAsset && dom.payout && dom.payout > 0) {
+          const clean = normalizeAsset(screenAsset);
+          this.onScreenPayouts.set(clean, { payout: dom.payout, at: Date.now() });
+          const existing = this.assetPayouts.get(clean);
+          if (!existing || existing.payoutPercent !== dom.payout) {
+            this.assetPayouts.set(clean, {
+              asset: clean,
+              name: dom.symbol || clean,
+              payoutPercent: dom.payout,
+              isOtc: clean.endsWith('_OTC'),
+              isActive: true,
+            });
+            this.emit('payouts', Array.from(this.assetPayouts.values()));
+          }
+        }
+
+        // Fall back to screen-scraped prices if stream goes quiet
         if (screenAsset && !isNaN(priceNum) && priceNum > 0) {
           const lastWs = this.lastTickAt.get(screenAsset) ?? 0;
           if (Date.now() - lastWs > 4000) {
             const tick: Tick = { asset: screenAsset, time: Date.now(), price: priceNum };
             this.recordTick(tick);
-          }
-          if (dom.payout) {
-            const pNum = parseFloat(dom.payout.replace(/[^0-9.]/g, ''));
-            if (!isNaN(pNum) && pNum > 0 && !this.assetPayouts.has(screenAsset)) {
-              this.assetPayouts.set(screenAsset, {
-                asset: screenAsset,
-                name: dom.symbol || screenAsset,
-                payoutPercent: pNum,
-                isOtc: screenAsset.endsWith('_OTC'),
-                isActive: true,
-              });
-            }
           }
         }
       } catch {
@@ -366,8 +454,14 @@ export class QxWsSniffer extends EventEmitter {
     // Check for Payouts
     const payouts = this.parser.extractPayouts(eventName, data);
     if (payouts.length > 0) {
+      const now = Date.now();
       for (const p of payouts) {
         this.registry.learn(p.asset, p.name);
+        const onScreen = this.onScreenPayouts.get(p.asset);
+        if (onScreen && now - onScreen.at < 60000) {
+          // Authoritative on-screen payout overrides WebSocket stream data
+          p.payoutPercent = onScreen.payout;
+        }
         this.assetPayouts.set(p.asset, p);
       }
       this.emit('payouts', payouts);
@@ -403,14 +497,62 @@ export class QxWsSniffer extends EventEmitter {
   }
 
   public getPayout(asset: string): AssetPayout | undefined {
-    return this.assetPayouts.get(normalizeAsset(asset));
+    const clean = normalizeAsset(asset);
+    const existing = this.assetPayouts.get(clean);
+    const onScreen = this.onScreenPayouts.get(clean);
+    if (onScreen && Date.now() - onScreen.at < 60000) {
+      if (existing) {
+        return { ...existing, payoutPercent: onScreen.payout };
+      }
+      return {
+        asset: clean,
+        name: clean,
+        payoutPercent: onScreen.payout,
+        isOtc: clean.endsWith('_OTC'),
+        isActive: true,
+      };
+    }
+    return existing;
   }
 
   public getAllPayouts(): AssetPayout[] {
-    return Array.from(this.assetPayouts.values());
+    const now = Date.now();
+    return Array.from(this.assetPayouts.values()).map((p) => {
+      const onScreen = this.onScreenPayouts.get(p.asset);
+      if (onScreen && now - onScreen.at < 60000) {
+        return { ...p, payoutPercent: onScreen.payout };
+      }
+      return p;
+    });
+  }
+
+  /**
+   * Directly sets authoritative on-screen payout (e.g. from active tab or deal form).
+   * Overrides any WebSocket stream data for this asset.
+   */
+  public setOnScreenPayout(asset: string, payoutPercent: number): void {
+    const clean = normalizeAsset(asset);
+    this.onScreenPayouts.set(clean, { payout: payoutPercent, at: Date.now() });
+    const existing = this.assetPayouts.get(clean);
+    this.assetPayouts.set(clean, {
+      asset: clean,
+      name: existing?.name || clean,
+      payoutPercent,
+      isOtc: clean.endsWith('_OTC'),
+      isActive: true,
+    });
+    this.emit('payouts', Array.from(this.assetPayouts.values()));
   }
 
   public getBalance(): AccountBalance | null {
     return this.currentBalance;
+  }
+
+  public getActiveTimeframe(): number {
+    return this.activeTimeframe;
+  }
+
+  public getActiveExpiry(): number {
+    return this.activeExpiry;
   }
 }

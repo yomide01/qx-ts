@@ -205,13 +205,12 @@ export class QxWsParser {
           const rawName = String(item[2] || rawSymbol);
           const generalPayout = QxWsParser.toPercent(item[5]);
 
-          // Quotex stores a separate payout for each expiry length near the END of the row
-          // (second-to-last groups: 1 minute, 5 minutes). Trading a 5-minute candle must use the
-          // 5-minute figure, which can differ from the general one in item[5].
+          // Quotex item[5] is the standard real-time payout percentage for this instrument
           const fromEnd = (n: number) => (item.length >= 20 ? QxWsParser.toPercent(item[item.length - n]) : null);
           const payout1m = fromEnd(9);
           const payout5m = fromEnd(8);
-          const payoutVal = payout5m ?? generalPayout;
+          // Default to 5m payout if available (matching trade duration), falling back to general payout
+          const payoutVal = (payout5m !== null && payout5m > 0) ? payout5m : generalPayout;
 
           if (rawSymbol && payoutVal !== null && payoutVal > 0) {
             const isOtc = rawSymbol.toLowerCase().includes('otc') || rawName.toLowerCase().includes('otc');

@@ -14,41 +14,43 @@ export class SignalScheduler extends EventEmitter {
     super();
     this.engine = new SignalEngine();
 
-    // Evaluate on every M5 candle close
+    // Evaluate on every candle close that matches the active chart timeframe
     this.aggregator.on('candleClosed', (candle) => {
-      if (candle.timeframe === 300) {
-        this.evaluateAsset(candle.asset, candle.openTime + 300000);
+      const activeTf = this.sniffer.getActiveTimeframe();
+      if (candle.timeframe === activeTf) {
+        this.evaluateAsset(candle.asset, candle.openTime + activeTf * 1000, activeTf);
       }
     });
 
-    // Also run an evaluation check 30 seconds prior to candle boundaries
-    setInterval(() => this.checkPreCandleScans(), 10000);
+    // Also run an evaluation check prior to candle boundaries (every 3 seconds)
+    setInterval(() => this.checkPreCandleScans(), 3000);
   }
 
   private checkPreCandleScans(): void {
     const now = Date.now();
-    const cycleMs = 300 * 1000;
+    const activeTf = this.sniffer.getActiveTimeframe();
+    const cycleMs = activeTf * 1000;
     const nextCandleOpen = Math.ceil(now / cycleMs) * cycleMs;
     const timeUntilOpen = nextCandleOpen - now;
 
-    // Within 45 seconds of candle open
-    if (timeUntilOpen <= 45000 && timeUntilOpen >= 5000) {
-      const payouts = this.sniffer.getAllPayouts();
-      for (const p of payouts) {
-        if (p.payoutPercent >= this.engine.minPayoutPercent && p.isActive) {
-          this.evaluateAsset(p.asset, nextCandleOpen);
-        }
+    // Scan window: 15-45 seconds prior to next candle (or proportional for short candles)
+    const scanThreshold = Math.min(45000, Math.max(5000, cycleMs * 0.3));
+    if (timeUntilOpen <= scanThreshold && timeUntilOpen >= 2000) {
+      const activeAsset = this.sniffer.getActiveAsset();
+      if (activeAsset) {
+        this.evaluateAsset(activeAsset, nextCandleOpen, activeTf);
       }
     }
   }
 
-  private evaluateAsset(asset: string, targetEntryTime: number): void {
-    const key = `${asset}_${targetEntryTime}`;
+  private evaluateAsset(asset: string, targetEntryTime: number, timeframeSeconds?: number): void {
+    const tf = timeframeSeconds || this.sniffer.getActiveTimeframe();
+    const key = `${asset}_${targetEntryTime}_${tf}`;
     if (this.lastEvaluatedCycle.has(key)) {
       return; // Already evaluated this asset for this cycle
     }
 
-    const history = this.aggregator.getHistory(asset, 300);
+    const history = this.aggregator.getHistory(asset, tf);
     const payout = this.sniffer.getPayout(asset);
     const payoutPercent = payout?.payoutPercent ?? 80;
     const isOtc = payout?.isOtc ?? asset.toLowerCase().includes('otc');
@@ -58,17 +60,19 @@ export class SignalScheduler extends EventEmitter {
       isOtc,
       history,
       payoutPercent,
-      targetEntryTime
+      targetEntryTime,
+      tf
     );
 
     this.lastEvaluatedCycle.set(key, Date.now());
 
     if (signal) {
+      const tfLabel = tf >= 60 ? `${tf / 60}M` : `${tf}s`;
       console.log(`\n================== [SIGNAL DETECTED] ==================`);
       console.log(`Asset      : ${signal.asset} (${signal.isOtc ? 'OTC' : 'Live'})`);
       console.log(`Direction  : ${signal.direction} (${signal.direction === 'CALL' ? 'GREEN / UP' : 'RED / DOWN'})`);
       console.log(`Entry Time : ${new Date(signal.entryTime).toLocaleTimeString()}`);
-      console.log(`Expiry     : ${new Date(signal.expiryTime).toLocaleTimeString()} (5M)`);
+      console.log(`Expiry     : ${new Date(signal.expiryTime).toLocaleTimeString()} (${tfLabel})`);
       console.log(`Confidence : ${signal.confidence}%`);
       console.log(`Payout     : ${signal.payoutPercent}%`);
       console.log(`Reasons    : ${signal.reasons.join(' | ')}`);

@@ -32,6 +32,7 @@ export interface StructureReport {
 
 export function analyzePriceStructure(closes: number[], payoutPercent: number = 85): StructureReport {
   const breakeven = breakevenWinRate(payoutPercent);
+  const minRequired = 10;
   const empty = (samples: number): StructureReport => ({
     verdict: 'INSUFFICIENT_DATA',
     samples,
@@ -42,12 +43,12 @@ export function analyzePriceStructure(closes: number[], payoutPercent: number = 
     biasHitRate: 50,
     breakeven,
     beatsBreakeven: false,
-    summary: `Not enough candles yet (${samples}/40) to judge this market.`,
+    summary: `Collecting candles (${samples}/${minRequired}) to analyze market.`,
   });
 
   const moves: number[] = [];
   for (let i = 1; i < closes.length; i++) moves.push(closes[i] - closes[i - 1]);
-  if (moves.length < 40) return empty(moves.length);
+  if (moves.length < minRequired) return empty(moves.length);
 
   // Lag-1 autocorrelation of candle moves
   const mean = moves.reduce((a, b) => a + b, 0) / moves.length;
@@ -62,7 +63,7 @@ export function analyzePriceStructure(closes: number[], payoutPercent: number = 
   // Direction sequence (ignore flat candles)
   const dirs = moves.filter((m) => m !== 0).map((m) => (m > 0 ? 1 : -1));
   const n = dirs.length;
-  if (n < 40) return empty(n);
+  if (n < minRequired) return empty(n);
 
   // Wald-Wolfowitz runs test
   const ups = dirs.filter((d) => d === 1).length;

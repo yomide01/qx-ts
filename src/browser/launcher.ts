@@ -100,12 +100,21 @@ export async function launchBrowserSession(
     // causes Chrome's "unsupported command-line flag: --no-sandbox" warning bar.
     chromiumSandbox: true,
     args: [
-      '--disable-blink-features=AutomationControlled',
       '--start-maximized',
       '--window-position=0,0',
       '--no-default-browser-check',
       '--no-first-run',
     ],
+  });
+
+  // Inject stealth script to clean navigator.webdriver without unsupported command-line flags
+  await context.addInitScript(() => {
+    try {
+      // Overwrite webdriver getter on Navigator prototype
+      Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
+        get: () => undefined,
+      });
+    } catch {}
   });
 
   const pages = context.pages();
