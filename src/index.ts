@@ -8,9 +8,14 @@ import { SignalPromptUI } from './ui/prompt.js';
 import { TradingSignal } from './analysis/signalEngine.js';
 import { TechnicalIndicators } from './analysis/indicators.js';
 import { normalizeAsset } from './stream/assets.js';
+import { StatusLine, installCleanConsole } from './ui/statusLine.js';
 import { analyzePriceStructure } from './analysis/marketQuality.js';
 
 async function bootstrap() {
+  // One tidy live status line; other messages never get glued onto it
+  const status = new StatusLine();
+  installCleanConsole(status);
+
   console.log('================================================================');
   console.log('       QX TRADING ASSISTANT: SEMI-AUTOMATED TRADING ENGINE      ');
   console.log('================================================================\n');
@@ -59,15 +64,18 @@ async function bootstrap() {
     }
   });
 
-  // Notify when payouts update
+  // Notify when payouts update (at most once a minute, so the screen stays readable)
+  let lastPayoutLogAt = 0;
   sniffer.on('payouts', (payouts: any[]) => {
+    if (Date.now() - lastPayoutLogAt < 60000) return;
     const top = payouts
       .filter((p: any) => p.payoutPercent >= 80)
       .slice(0, 4)
       .map((p: any) => `${p.asset}: ${p.payoutPercent}%`)
       .join(' | ');
     if (top) {
-      console.log(`\n[Payouts] Available High-Payout Pairs: ${top}`);
+      lastPayoutLogAt = Date.now();
+      console.log(`[Payouts] Available High-Payout Pairs: ${top}`);
     }
   });
 
@@ -119,6 +127,9 @@ async function bootstrap() {
 
   console.log('\n[System Active] Engine running. Monitoring ticks, payouts, and M5 candle setups...');
   console.log('[System Active] Keep the Quotex trading tab open. Press Ctrl+C to stop.\n');
+
+  let waitingSince = 0;
+  let hintShown = false;
 
   // Active Real-Time Market Analysis Heartbeat (Updates every 3 seconds)
   setInterval(() => {
@@ -172,17 +183,33 @@ async function bootstrap() {
             ? 'coin-flip-like'
             : 'some pattern';
 
-      process.stdout.write(
-        `\r[${modeStr}] ${activeAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
+      waitingSince = 0;
+      status.show(
+        `[${modeStr}] ${activeAsset} @ ${latestTick?.price.toFixed(5) || '--'} (${
           payout?.payoutPercent || '--'
         }%) | Next M5: ${minStr}:${secStr} | ${trendStr} | RSI ${rsiStr} | Stoch ${stochStr} | Structure: ${structureStr} | Ticks: ${
           sniffer.totalTicksReceived
-        }   `
+        }`
       );
     } else {
-      process.stdout.write(
-        `\r[STREAM ACTIVE] [${modeStr}] Waiting for chart data... Next 5M candle in: ${minStr}:${secStr} | Total frames: ${sniffer.totalFramesReceived} `
-      );
+      const accountLabel = mode === 'LIVE' ? 'LIVE ACCOUNT' : mode === 'DEMO' ? 'DEMO' : 'account ?';
+      const frames = sniffer.totalFramesReceived;
+      if (frames === 0) {
+        status.show(`[${accountLabel}] Connecting to Quotex... no data yet | Next 5M candle: ${minStr}:${secStr}`);
+      } else {
+        status.show(
+          `[${accountLabel}] Connected (${frames} messages, ${sniffer.getAllPayouts().length} markets) - waiting for a chart | Next 5M candle: ${minStr}:${secStr}`
+        );
+        // Data is flowing but no prices: almost always the chart has not finished loading
+        if (waitingSince === 0) waitingSince = Date.now();
+        if (!hintShown && Date.now() - waitingSince > 90000) {
+          hintShown = true;
+          console.log(
+            '[Hint] Connected to Quotex but no prices yet. Prices only flow once a candlestick chart is showing in the Chrome window. ' +
+              'If the page is stuck on grey boxes, press F5 in that window or check your internet.'
+          );
+        }
+      }
     }
   }, 2000);
 
