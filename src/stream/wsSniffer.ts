@@ -105,10 +105,6 @@ export class QxWsSniffer extends EventEmitter {
         }
       });
 
-      this.cdpSession.on('Network.webSocketCreated', (event: any) => {
-        console.log(`[CDP] WebSocket connection established: ${event.url}`);
-      });
-
       console.log('[WsSniffer] CDP network stream listener successfully active.');
     } catch (err) {
       console.warn('[WsSniffer Warning] CDP session notice:', (err as Error).message);

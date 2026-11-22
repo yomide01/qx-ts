@@ -13,7 +13,7 @@
     "prompt:test": "tsx src/testDryRun.ts",
     "test": "tsx src/systemDiagnostics.ts",
     "debug:dom": "tsx src/stream/domProbe.ts",
-    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/stream/account.test.ts"
+    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts"
   },
   "keywords": [],
   "author": "",
