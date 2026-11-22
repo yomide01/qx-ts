@@ -96,6 +96,9 @@ export async function launchBrowserSession(
     headless: config.headless,
     viewport: null, // Natural window scaling to fit screen
     ignoreDefaultArgs: ['--enable-automation'],
+    // Playwright switches Chrome's security sandbox OFF unless told otherwise, which is what
+    // causes Chrome's "unsupported command-line flag: --no-sandbox" warning bar.
+    chromiumSandbox: true,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--start-maximized',
