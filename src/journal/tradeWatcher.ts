@@ -3,10 +3,19 @@ import { QxWsSniffer } from '../stream/wsSniffer.js';
 import { TradingJournalDB } from './database.js';
 import { TradeDeal } from '../stream/types.js';
 import { TradeRecord, IndicatorSnapshot } from './types.js';
-import { isOtcAsset } from '../stream/assets.js';
+import { isOtcAsset, normalizeAsset } from '../stream/assets.js';
+
+export interface PendingSignalContext {
+  confidence: number;
+  reason: string;
+  regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY';
+  indicators: IndicatorSnapshot;
+  createdAt: number;
+}
 
 export class TradeWatcher extends EventEmitter {
   private warnedUnknownMode = false;
+  private pendingContextByAsset = new Map<string, PendingSignalContext>();
 
   constructor(
     private sniffer: QxWsSniffer,
@@ -16,11 +25,33 @@ export class TradeWatcher extends EventEmitter {
     this.sniffer.on('deal', (deal: TradeDeal) => this.onDeal(deal));
   }
 
+  /**
+   * Registers the latest signal context for an asset so that when the deal packet
+   * arrives via WebSocket or Redux store polling, its regime and indicator snapshot are stored.
+   */
+  public setPendingSignalContext(
+    asset: string,
+    confidence: number,
+    reason: string,
+    regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY',
+    indicators: IndicatorSnapshot
+  ): void {
+    this.pendingContextByAsset.set(normalizeAsset(asset), {
+      confidence,
+      reason,
+      regime,
+      indicators,
+      createdAt: Date.now(),
+    });
+  }
+
   private onDeal(deal: TradeDeal): void {
+    const normAsset = normalizeAsset(deal.asset);
     const existing = this.db.getTrade(deal.id);
-    const assetPayout = this.sniffer.getPayout(deal.asset);
-    const payoutPercent = assetPayout?.payoutPercent ?? 80;
-    const isOtc = assetPayout?.isOtc ?? isOtcAsset(deal.asset);
+    const assetPayout = this.sniffer.getPayout(normAsset);
+    const rawPayout = assetPayout?.payoutPercent ?? 80;
+    const payoutPercent = TradingJournalDB.sanitizePayoutPercent(rawPayout, deal.amount);
+    const isOtc = assetPayout?.isOtc ?? isOtcAsset(normAsset);
 
     // Which account was this trade on? Prefer what Quotex says about the deal itself, then the
     // account the bot currently sees open. Never silently assume demo.
@@ -39,13 +70,16 @@ export class TradeWatcher extends EventEmitter {
     }
 
     if (!existing) {
+      const pending = this.pendingContextByAsset.get(normAsset);
+      const freshContext = pending && Date.now() - pending.createdAt < 90_000 ? pending : undefined;
+
       // New trade opening
       const newRecord: TradeRecord = {
         id: deal.id,
-        asset: deal.asset,
+        asset: normAsset,
         isOtc,
         direction: deal.direction.toUpperCase() as 'CALL' | 'PUT',
-        timeframeSeconds: deal.closeTime > deal.openTime ? Math.round((deal.closeTime - deal.openTime) / 1000) : 300,
+        timeframeSeconds: TradingJournalDB.computeTimeframeSeconds(deal.openTime, deal.closeTime, 300),
         payoutPercent,
         stakeAmount: deal.amount,
         openTime: deal.openTime,
@@ -53,6 +87,10 @@ export class TradeWatcher extends EventEmitter {
         openPrice: deal.openPrice,
         status: 'OPEN',
         isDemo,
+        signalConfidence: freshContext?.confidence,
+        signalReason: freshContext?.reason,
+        marketRegime: freshContext?.regime,
+        indicatorsAtEntry: freshContext?.indicators,
       };
 
       this.db.recordTrade(newRecord);
@@ -60,8 +98,8 @@ export class TradeWatcher extends EventEmitter {
       this.emit('tradeOpened', newRecord);
     }
 
-    // Check if the deal has completed/settled
-    if (deal.status !== 'open') {
+    // Check if the deal has genuinely completed/settled (and hasn't already been settled)
+    if (deal.status !== 'open' && (!existing || existing.status === 'OPEN')) {
       const statusMap = {
         won: 'WON' as const,
         lost: 'LOST' as const,

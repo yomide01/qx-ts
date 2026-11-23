@@ -107,6 +107,53 @@ function runJournalTests() {
   }
   console.log(`✓ Breakeven threshold calculation passed: ${breakeven.toFixed(2)}%`);
 
+  // Test 6: Regression — sanitize corrupted payout (1380 dollar profit on 1500 stake -> 92%) & UNIX second timeframe calculation
+  const repairedPayout = TradingJournalDB.sanitizePayoutPercent(1380, 1500);
+  if (repairedPayout !== 92) {
+    throw new Error(`Expected corrupted payout 1380 on 1500 stake to sanitize to 92%, got ${repairedPayout}`);
+  }
+  const tfFromUnixSeconds = TradingJournalDB.computeTimeframeSeconds(1795452891, 1795453191, 300);
+  if (tfFromUnixSeconds !== 300) {
+    throw new Error(`Expected 300s timeframe from UNIX-second timestamps, got ${tfFromUnixSeconds}`);
+  }
+  console.log('✓ Payout sanitization (1380 -> 92%) and UNIX-second timeframe calculation passed');
+
+  // Test 7: Regression — attaching signal context after initial trade open updates SQLite row via ON CONFLICT
+  const bareTrade: TradeRecord = {
+    id: 'deal_004',
+    asset: 'GBPUSD',
+    isOtc: false,
+    direction: 'CALL',
+    timeframeSeconds: 0,
+    payoutPercent: 1380,
+    stakeAmount: 1500,
+    openTime: 1795452891,
+    closeTime: 1795453191,
+    openPrice: 1.265,
+    status: 'OPEN',
+    isDemo: true,
+  };
+  db.recordTrade(bareTrade);
+  db.recordTrade({
+    ...bareTrade,
+    signalConfidence: 88,
+    signalReason: 'EMA Pullback Sniper',
+    marketRegime: 'TRENDING_UP',
+    indicatorsAtEntry: { rsi: 48.5, emaFast: 1.2648, emaSlow: 1.2640 },
+  });
+  const updatedTrade4 = db.getTrade('deal_004');
+  if (
+    !updatedTrade4 ||
+    updatedTrade4.payoutPercent !== 92 ||
+    updatedTrade4.timeframeSeconds !== 300 ||
+    updatedTrade4.marketRegime !== 'TRENDING_UP' ||
+    updatedTrade4.signalConfidence !== 88 ||
+    updatedTrade4.indicatorsAtEntry?.rsi !== 48.5
+  ) {
+    throw new Error(`Failed to update signal context or sanitize fields on conflict: ${JSON.stringify(updatedTrade4)}`);
+  }
+  console.log('✓ Signal context attachment & ON CONFLICT update passed');
+
   db.close();
   console.log('\nAll Phase 3 SQLite Journal & Analytics Tests Passed!\n');
 }

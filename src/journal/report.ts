@@ -82,9 +82,10 @@ function generateReport() {
     console.log('• Keep logging demo trades. Judging a strategy takes hundreds of trades, not dozens.');
   }
 
-  // Demo vs live split (a mixed-up journal makes every number above unreliable)
-  const demoTrades = trades.filter((t) => t.isDemo).length;
-  console.log(`\n--- ACCOUNT SPLIT ---\n• Demo trades: ${demoTrades} | Live trades: ${trades.length - demoTrades}`);
+  // Demo vs live split (count only closed/settled trades to match summary above)
+  const closedTrades = trades.filter((t) => t.status !== 'OPEN');
+  const demoTrades = closedTrades.filter((t) => t.isDemo).length;
+  console.log(`\n--- ACCOUNT SPLIT ---\n• Demo trades: ${demoTrades} | Live trades: ${closedTrades.length - demoTrades}`);
 
   console.log('================================================================\n');
   db.close();

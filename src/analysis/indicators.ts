@@ -15,7 +15,39 @@ export interface CandleWickAnalysis {
   totalRange: number;
 }
 
+export type CandlestickPattern =
+  | 'PINBAR_BULLISH'
+  | 'PINBAR_BEARISH'
+  | 'ENGULFING_BULLISH'
+  | 'ENGULFING_BEARISH'
+  | 'DOJI'
+  | 'NONE';
+
+export interface SupportResistanceLevels {
+  supports: number[];
+  resistances: number[];
+}
+
 export class TechnicalIndicators {
+  /**
+   * Simple Moving Average (SMA)
+   */
+  public static calculateSMA(prices: number[], period: number): number[] {
+    if (prices.length < period) return [];
+    const smaArray: number[] = [];
+    let sum = 0;
+    for (let i = 0; i < period; i++) {
+      sum += prices[i];
+    }
+    smaArray.push(sum / period);
+
+    for (let i = period; i < prices.length; i++) {
+      sum += prices[i] - prices[i - period];
+      smaArray.push(sum / period);
+    }
+    return smaArray;
+  }
+
   /**
    * Exponential Moving Average (EMA)
    */
@@ -85,10 +117,45 @@ export class TechnicalIndicators {
   }
 
   /**
+   * Average True Range (ATR - Wilder's Smoothing)
+   * Measures true market volatility independent of price direction.
+   */
+  public static calculateATR(candles: Candle[], period: number = 14): number[] {
+    if (candles.length < 2) return [];
+    const effPeriod = Math.max(2, Math.min(period, candles.length - 1));
+
+    const trValues: number[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const current = candles[i];
+      const prev = candles[i - 1];
+      const tr = Math.max(
+        current.high - current.low,
+        Math.abs(current.high - prev.close),
+        Math.abs(current.low - prev.close)
+      );
+      trValues.push(tr);
+    }
+
+    if (trValues.length < effPeriod) return [];
+
+    const atrValues: number[] = [];
+    let initialAtr = trValues.slice(0, effPeriod).reduce((a, b) => a + b, 0) / effPeriod;
+    atrValues.push(initialAtr);
+
+    let prevAtr = initialAtr;
+    for (let i = effPeriod; i < trValues.length; i++) {
+      const currentAtr = (prevAtr * (effPeriod - 1) + trValues[i]) / effPeriod;
+      atrValues.push(currentAtr);
+      prevAtr = currentAtr;
+    }
+
+    return atrValues;
+  }
+
+  /**
    * Slow Stochastic Oscillator (default 14, 3, 3).
-   * %K shows where the close sits inside the recent high-low range (0 = at the lowest low,
-   * 100 = at the highest high); %D is a smoothed copy of %K used for crossover timing.
-   * Both arrays end at the most recent candle.
+   * %K shows where the close sits inside the recent high-low range (0 = at lowest low, 100 = at highest high).
+   * %D is a smoothed copy of %K used for crossover timing.
    */
   public static calculateStochastic(
     candles: Candle[],
@@ -186,6 +253,114 @@ export class TechnicalIndicators {
   }
 
   /**
+   * Identifies micro-structure price action patterns (Pinbars, Engulfing, Doji)
+   */
+  public static detectPattern(candle: Candle, prevCandle?: Candle): CandlestickPattern {
+    const wick = this.analyzeCandleWicks(candle);
+    if (wick.totalRange <= 0) return 'NONE';
+
+    // Doji: Body takes up <= 10% of total range
+    if (wick.bodyRatio <= 0.10) {
+      return 'DOJI';
+    }
+
+    // Bullish Pinbar (Hammer / Dragonfly): Lower rejection wick >= 55% of range, upper wick <= 20%
+    if (wick.lowerWickRatio >= 0.55 && wick.upperWickRatio <= 0.20) {
+      return 'PINBAR_BULLISH';
+    }
+
+    // Bearish Shooting Star / Pinbar: Upper rejection wick >= 55% of range, lower wick <= 20%
+    if (wick.upperWickRatio >= 0.55 && wick.lowerWickRatio <= 0.20) {
+      return 'PINBAR_BEARISH';
+    }
+
+    // Engulfing patterns require a previous candle
+    if (prevCandle) {
+      const prevWick = this.analyzeCandleWicks(prevCandle);
+      const prevBody = Math.abs(prevCandle.close - prevCandle.open);
+      const currBody = Math.abs(candle.close - candle.open);
+
+      // Bullish Engulfing: previous was bearish, current is bullish and completely engulfs previous body
+      if (
+        !prevWick.isBullish &&
+        wick.isBullish &&
+        candle.open <= prevCandle.close &&
+        candle.close >= prevCandle.open &&
+        currBody > prevBody
+      ) {
+        return 'ENGULFING_BULLISH';
+      }
+
+      // Bearish Engulfing: previous was bullish, current is bearish and completely engulfs previous body
+      if (
+        prevWick.isBullish &&
+        !wick.isBullish &&
+        candle.open >= prevCandle.close &&
+        candle.close <= prevCandle.open &&
+        currBody > prevBody
+      ) {
+        return 'ENGULFING_BEARISH';
+      }
+    }
+
+    return 'NONE';
+  }
+
+  /**
+   * Clusters recent swing highs and swing lows to detect Key Support and Resistance zones.
+   */
+  public static calculateSupportResistance(candles: Candle[], lookback: number = 25): SupportResistanceLevels {
+    if (candles.length < 5) return { supports: [], resistances: [] };
+    const slice = candles.slice(-Math.min(candles.length, lookback));
+
+    const swingHighs: number[] = [];
+    const swingLows: number[] = [];
+
+    for (let i = 1; i < slice.length - 1; i++) {
+      const c = slice[i];
+      const prev = slice[i - 1];
+      const next = slice[i + 1];
+
+      // Swing High: peak higher than neighbor wicks
+      if (c.high >= prev.high && c.high >= next.high) {
+        swingHighs.push(c.high);
+      }
+      // Swing Low: trough lower than neighbor wicks
+      if (c.low <= prev.low && c.low <= next.low) {
+        swingLows.push(c.low);
+      }
+    }
+
+    // Cluster levels that are within 0.05% of each other
+    const cluster = (levels: number[]): number[] => {
+      if (levels.length === 0) return [];
+      const sorted = [...levels].sort((a, b) => a - b);
+      const clustered: number[] = [];
+      let currentCluster: number[] = [sorted[0]];
+
+      for (let i = 1; i < sorted.length; i++) {
+        const val = sorted[i];
+        const avg = currentCluster.reduce((a, b) => a + b, 0) / currentCluster.length;
+        if (Math.abs(val - avg) / avg < 0.0008) {
+          currentCluster.push(val);
+        } else {
+          clustered.push(currentCluster.reduce((a, b) => a + b, 0) / currentCluster.length);
+          currentCluster = [val];
+        }
+      }
+      if (currentCluster.length > 0) {
+        clustered.push(currentCluster.reduce((a, b) => a + b, 0) / currentCluster.length);
+      }
+      return clustered;
+    };
+
+    return {
+      supports: cluster(swingLows),
+      resistances: cluster(swingHighs),
+    };
+  }
+
+  /**
    * Classifies the market regime using closed candles
    */
   public static classifyRegime(candles: Candle[]): 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY' {
@@ -203,7 +378,6 @@ export class TechnicalIndicators {
     const currentEmaFast = emaFastArr[emaFastArr.length - 1];
     const currentEmaSlow = emaSlowArr[emaSlowArr.length - 1];
     const prevEmaFast = emaFastArr[emaFastArr.length - 2];
-    const prevEmaSlow = emaSlowArr[emaSlowArr.length - 2];
 
     // High volatility check (wide Bollinger bandwidth)
     if (bb.bandwidth > 0.008) {

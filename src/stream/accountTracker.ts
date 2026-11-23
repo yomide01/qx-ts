@@ -23,7 +23,7 @@ export class AccountModeTracker {
       this.screen = mode;
     } else {
       const slot = source === 'page address' ? this.url : this.request;
-      if (mode !== slot.mode) {
+      if (mode !== slot.mode || (mode !== 'UNKNOWN' && mode !== before)) {
         slot.mode = mode;
         slot.at = now;
       }

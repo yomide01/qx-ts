@@ -6,14 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
-    "browser:init": "tsx src/browser/launch.ts",
-    "stream:test": "tsx src/stream/testSniffer.ts",
-    "debug:ws": "tsx src/stream/wsDebugger.ts",
     "journal:report": "tsx src/journal/report.ts",
-    "prompt:test": "tsx src/testDryRun.ts",
-    "test": "tsx src/systemDiagnostics.ts",
-    "debug:dom": "tsx src/stream/domProbe.ts",
-    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts"
+    "test": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/analysis/signalEngine.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts && tsx src/stream/parser.test.ts && tsx src/journal/journal.test.ts",
+    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/analysis/signalEngine.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts && tsx src/stream/parser.test.ts && tsx src/journal/journal.test.ts"
   },
   "keywords": [],
   "author": "",

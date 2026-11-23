@@ -13,15 +13,25 @@ export class CandleAggregator extends EventEmitter {
   private activeCandles: Map<string, Candle> = new Map();
   private candleHistory: Map<string, Candle[]> = new Map();
   private supportedTimeframes: number[] = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
-  private maxHistorySize: number = 100;
+  private maxHistorySize: number = 250;
   private lastSeededLog: Map<string, number> = new Map();
 
   constructor(private sniffer: QxWsSniffer) {
     super();
     this.sniffer.on('tick', (tick: Tick) => this.onTick(tick));
-    this.sniffer.on('history', (h: { asset: string; period: number; ticks: Tick[] }) => {
-      this.seedHistory(h.asset, h.ticks);
+    this.sniffer.on('history', (h: { asset: string; period: number; ticks: Tick[]; candles?: Candle[] }) => {
+      if (h.candles && h.candles.length > 0) {
+        this.seedDirectCandles(h.asset, h.period, h.candles, h.ticks);
+      } else {
+        this.seedHistory(h.asset, h.ticks);
+      }
     });
+    this.sniffer.on(
+      'chartHistoryPoints',
+      (payload: { asset: string; timeframe: number; points: Array<{ value: number; time: number }> }) => {
+        this.seedFromChartHistory(payload.asset, payload.timeframe, payload.points);
+      }
+    );
   }
 
   private onTick(tick: Tick): void {
@@ -33,6 +43,9 @@ export class CandleAggregator extends EventEmitter {
       const key = `${tick.asset}_${tf}`;
 
       let current = this.activeCandles.get(key);
+      if (current && candleOpenTime < current.openTime) {
+        continue; // Ignore out-of-order / slightly older fallback timestamps
+      }
 
       if (!current || current.openTime !== candleOpenTime) {
         // If there was an existing open candle, close it
@@ -126,42 +139,114 @@ export class CandleAggregator extends EventEmitter {
         active.isClosed = false;
         this.activeCandles.set(key, active);
         this.candleHistory.set(key, candles.slice(-this.maxHistorySize));
-
-        // Debounce log to once every 30 seconds per key to prevent terminal log flooding
-        const lastLog = this.lastSeededLog.get(key) || 0;
-        if (Date.now() - lastLog > 30000) {
-          this.lastSeededLog.set(key, Date.now());
-          const tfName = tf === 60 ? 'M1' : tf === 300 ? 'M5' : `${tf}s`;
-          console.log(`[CandleAggregator] Seeded ${candles.length} closed ${tfName} candles for ${cleanAsset}. Ready!`);
-        }
       }
     }
   }
 
   /**
+   * Seeds historical candles directly from Quotex's on-screen chart historyPoints
+   * (chartSettings.chartById.graph.historyPoints), which contains both 4-point compressed
+   * historical candles and live ticks for the currently displayed asset and timeframe.
+   */
+  public seedFromChartHistory(
+    asset: string,
+    timeframeSeconds: number,
+    points: Array<{ value: number; time: number }>
+  ): void {
+    if (!points || points.length === 0 || !timeframeSeconds) return;
+    const cleanAsset = normalizeAsset(asset);
+    const tfMs = timeframeSeconds * 1000;
+    const key = `${cleanAsset}_${timeframeSeconds}`;
+
+    const sorted = [...points]
+      .filter((p) => typeof p.value === 'number' && !isNaN(p.value) && typeof p.time === 'number' && !isNaN(p.time))
+      .sort((a, b) => a.time - b.time);
+    if (sorted.length === 0) return;
+
+    const candlesMap: Map<number, Candle> = new Map();
+    for (const pt of sorted) {
+      const timeMs = pt.time > 1e11 ? pt.time : pt.time * 1000;
+      const candleOpenTime = Math.floor(timeMs / tfMs) * tfMs;
+      let candle = candlesMap.get(candleOpenTime);
+      if (!candle) {
+        candle = {
+          asset: cleanAsset,
+          timeframe: timeframeSeconds,
+          openTime: candleOpenTime,
+          open: pt.value,
+          high: pt.value,
+          low: pt.value,
+          close: pt.value,
+          isClosed: true,
+        };
+        candlesMap.set(candleOpenTime, candle);
+      } else {
+        candle.high = Math.max(candle.high, pt.value);
+        candle.low = Math.min(candle.low, pt.value);
+        candle.close = pt.value;
+      }
+    }
+
+    const candles = Array.from(candlesMap.values()).sort((a, b) => a.openTime - b.openTime);
+    if (candles.length > 0) {
+      const active = candles.pop()!;
+      active.isClosed = false;
+      this.activeCandles.set(key, active);
+
+      const closedSlice = candles.slice(-this.maxHistorySize);
+      this.candleHistory.set(key, closedSlice);
+    }
+  }
+
+  /**
+   * Seeds explicit pre-aggregated candles from Quotex history/list/v2 packets.
+   */
+  public seedDirectCandles(asset: string, period: number, rawCandles: Candle[], recentTicks?: Tick[]): void {
+    const cleanAsset = normalizeAsset(asset);
+    const tf = period || 60;
+    const key = `${cleanAsset}_${tf}`;
+    const sorted = [...rawCandles].sort((a, b) => a.openTime - b.openTime);
+    if (sorted.length > 0) {
+      this.candleHistory.set(key, sorted.slice(-this.maxHistorySize));
+    }
+    if (recentTicks && recentTicks.length > 0) {
+      this.seedHistory(cleanAsset, recentTicks);
+    }
+  }
+
+  /**
    * Returns closed candles for an asset and timeframe (chronological order).
-   * If target timeframe has fewer than 8 candles, attempts to synthesize from sub-period (e.g. M1 -> M5).
+   * If target timeframe has fewer than 8 candles, attempts to synthesize from sub-period (e.g. M1 -> M5)
+   * using aligned timestamp boundaries.
    */
   public getHistory(asset: string, timeframeSeconds: number): Candle[] {
     const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
     const direct = this.candleHistory.get(key);
     if (direct && direct.length >= 8) return direct;
 
-    // Synthesize higher timeframe candles from M1 (60s) if available
+    // Synthesize higher timeframe candles from M1 (60s) aligned by floor timestamp
     if (timeframeSeconds > 60 && timeframeSeconds % 60 === 0) {
       const m1Key = `${normalizeAsset(asset)}_60`;
       const m1Candles = this.candleHistory.get(m1Key) || [];
+      const tfMs = timeframeSeconds * 1000;
       const ratio = timeframeSeconds / 60;
       if (m1Candles.length >= ratio) {
+        const buckets = new Map<number, Candle[]>();
+        for (const c of m1Candles) {
+          const bucketOpen = Math.floor(c.openTime / tfMs) * tfMs;
+          const group = buckets.get(bucketOpen) || [];
+          group.push(c);
+          buckets.set(bucketOpen, group);
+        }
         const synthesized: Candle[] = [];
-        const groupCount = Math.floor(m1Candles.length / ratio);
-        for (let g = 0; g < groupCount; g++) {
-          const slice = m1Candles.slice(g * ratio, (g + 1) * ratio);
-          if (slice.length === ratio) {
+        const sortedKeys = Array.from(buckets.keys()).sort((a, b) => a - b);
+        for (const bucketOpen of sortedKeys) {
+          const slice = buckets.get(bucketOpen)!.sort((a, b) => a.openTime - b.openTime);
+          if (slice.length >= Math.min(ratio, 3)) {
             synthesized.push({
               asset: slice[0].asset,
               timeframe: timeframeSeconds,
-              openTime: slice[0].openTime,
+              openTime: bucketOpen,
               open: slice[0].open,
               high: Math.max(...slice.map((c) => c.high)),
               low: Math.min(...slice.map((c) => c.low)),

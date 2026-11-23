@@ -1,4 +1,5 @@
 import { TradeRecord, AnalyticsSummary } from './types.js';
+import { TradingJournalDB } from './database.js';
 
 export class JournalAnalytics {
   /**
@@ -24,8 +25,9 @@ export class JournalAnalytics {
 
     for (const trade of closed) {
       const pnl = trade.profitLoss ?? 0;
+      const cleanPayout = TradingJournalDB.sanitizePayoutPercent(trade.payoutPercent, trade.stakeAmount);
       totalPnL += pnl;
-      totalPayout += trade.payoutPercent;
+      totalPayout += cleanPayout;
 
       // Asset stats
       if (!byAsset[trade.asset]) {

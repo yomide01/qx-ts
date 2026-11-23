@@ -15,6 +15,28 @@ export class TradingJournalDB {
 
     this.db = new DatabaseSync(finalPath);
     this.initSchema();
+    this.repairHistoricalAnomalies();
+  }
+
+  public static sanitizePayoutPercent(payoutPercent: number, stakeAmount?: number): number {
+    if (!Number.isFinite(payoutPercent) || payoutPercent <= 0) return 80;
+    if (payoutPercent > 100 && stakeAmount && stakeAmount > 0) {
+      const derived = Math.round((payoutPercent / stakeAmount) * 1000) / 10;
+      if (derived >= 10 && derived <= 100) return derived;
+    }
+    if (payoutPercent <= 1) return Math.round(payoutPercent * 1000) / 10;
+    return Math.min(100, Math.max(10, payoutPercent));
+  }
+
+  public static computeTimeframeSeconds(openTime: number, closeTime: number, fallback: number = 300): number {
+    if (!Number.isFinite(openTime) || !Number.isFinite(closeTime) || closeTime <= openTime) {
+      return fallback;
+    }
+    const diff = closeTime - openTime;
+    // If timestamps are in milliseconds (> 1e11), diff is in ms; if in seconds (< 1e11), diff is already in seconds.
+    const isMs = openTime > 1e11 || closeTime > 1e11 || diff > 86400 * 2;
+    const sec = isMs ? Math.round(diff / 1000) : Math.round(diff);
+    return sec > 0 ? sec : fallback;
   }
 
   private initSchema(): void {
@@ -49,9 +71,59 @@ export class TradingJournalDB {
   }
 
   /**
-   * Records a new trade entry in the database.
+   * Automatically repairs legacy database anomalies:
+   * 1. Fixes rows where dollar profit (e.g. 1380 on a 1500 stake) was stored in payout_percent.
+   * 2. Fixes rows where timeframe_seconds was rounded to 0 due to seconds vs milliseconds division.
+   * 3. Removes stale orphaned 'OPEN' rows whose scheduled close_time expired > 1 hour ago without settlement.
+   */
+  private repairHistoricalAnomalies(): void {
+    try {
+      this.db.exec(`
+        UPDATE trades
+        SET payout_percent = CASE
+          WHEN stake_amount > 0 AND (payout_percent / stake_amount) * 100 BETWEEN 10 AND 100
+            THEN ROUND((payout_percent / stake_amount) * 100, 1)
+          ELSE 80
+        END
+        WHERE payout_percent > 100 OR payout_percent < 10;
+
+        UPDATE trades
+        SET timeframe_seconds = CASE
+          WHEN (close_time - open_time) > 172800 THEN ROUND((close_time - open_time) / 1000.0)
+          WHEN (close_time - open_time) > 0 THEN ROUND(close_time - open_time)
+          ELSE 300
+        END
+        WHERE timeframe_seconds <= 0 AND close_time > open_time;
+      `);
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const nowMs = Date.now();
+      const staleStmt = this.db.prepare(`
+        DELETE FROM trades
+        WHERE status = 'OPEN'
+          AND profit_loss IS NULL
+          AND close_time > 0
+          AND (
+            (close_time < 100000000000 AND close_time < ? - 3600)
+            OR (close_time >= 100000000000 AND close_time < ? - 3600000)
+          )
+      `);
+      staleStmt.run(nowSec, nowMs);
+    } catch {
+      // Safe fallback for read-only or in-memory test instances
+    }
+  }
+
+  /**
+   * Records a new trade entry in the database (or updates outcome and signal context on conflict).
    */
   public recordTrade(trade: TradeRecord): void {
+    const cleanPayout = TradingJournalDB.sanitizePayoutPercent(trade.payoutPercent, trade.stakeAmount);
+    const cleanTf =
+      trade.timeframeSeconds > 0
+        ? trade.timeframeSeconds
+        : TradingJournalDB.computeTimeframeSeconds(trade.openTime, trade.closeTime, 300);
+
     const stmt = this.db.prepare(`
       INSERT INTO trades (
         id, asset, is_otc, direction, timeframe_seconds, payout_percent,
@@ -65,9 +137,15 @@ export class TradingJournalDB {
         ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
-        close_price = excluded.close_price,
+        timeframe_seconds = CASE WHEN excluded.timeframe_seconds > 0 THEN excluded.timeframe_seconds ELSE trades.timeframe_seconds END,
+        payout_percent = CASE WHEN excluded.payout_percent BETWEEN 10 AND 100 THEN excluded.payout_percent ELSE trades.payout_percent END,
+        close_price = COALESCE(excluded.close_price, trades.close_price),
         status = excluded.status,
-        profit_loss = excluded.profit_loss
+        profit_loss = COALESCE(excluded.profit_loss, trades.profit_loss),
+        signal_confidence = COALESCE(excluded.signal_confidence, trades.signal_confidence),
+        signal_reason = COALESCE(excluded.signal_reason, trades.signal_reason),
+        market_regime = COALESCE(excluded.market_regime, trades.market_regime),
+        indicators_at_entry = COALESCE(excluded.indicators_at_entry, trades.indicators_at_entry)
     `);
 
     stmt.run(
@@ -75,8 +153,8 @@ export class TradingJournalDB {
       trade.asset.toUpperCase(),
       trade.isOtc ? 1 : 0,
       trade.direction.toUpperCase(),
-      trade.timeframeSeconds,
-      trade.payoutPercent,
+      cleanTf,
+      cleanPayout,
       trade.stakeAmount,
       trade.openTime,
       trade.closeTime,

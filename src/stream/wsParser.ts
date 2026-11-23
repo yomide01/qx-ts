@@ -159,28 +159,72 @@ export class QxWsParser {
   }
 
   /**
-   * Extracts historical ticks from Quotex "history/list/v2" packet.
-   * Format: { asset: "EURGBP", period: 300, history: [[timestamp, price, flag], ...] }
+   * Extracts historical ticks and candles from Quotex "history/list/v2" packet.
+   * Format: { asset: "EURGBP", period: 300, candles: [[time, open, close, high, low], ...], history: [[timestamp, price, flag], ...] }
    */
-  public extractHistory(eventName: string, data: any): { asset: string; period: number; ticks: Tick[] } | null {
+  public extractHistory(
+    eventName: string,
+    data: any
+  ): { asset: string; period: number; ticks: Tick[]; candles?: any[] } | null {
     if (!data || typeof data !== 'object') return null;
-    if (data.history && Array.isArray(data.history) && data.asset) {
+    if ((Array.isArray(data.history) || Array.isArray(data.candles)) && data.asset) {
       const asset = normalizeAsset(data.asset);
       const period = Number(data.period || 300);
       const ticks: Tick[] = [];
+      const candles: any[] = [];
 
-      for (const item of data.history) {
-        if (Array.isArray(item) && item.length >= 2) {
-          let time = Number(item[0]);
-          if (time < 1e11) time = Math.round(time * 1000);
-          const price = Number(item[1]);
-          if (!isNaN(price) && price > 0) {
-            ticks.push({ asset, time, price });
+      if (Array.isArray(data.candles)) {
+        for (const c of data.candles) {
+          if (Array.isArray(c) && c.length >= 5) {
+            let t = Number(c[0]);
+            if (t < 1e11) t = Math.round(t * 1000);
+            const open = Number(c[1]);
+            const close = Number(c[2]);
+            const high = Math.max(open, close, Number(c[3]));
+            const low = Math.min(open, close, Number(c[4]));
+            if (!isNaN(open) && open > 0) {
+              candles.push({
+                asset,
+                timeframe: period,
+                openTime: Math.floor(t / (period * 1000)) * (period * 1000),
+                open,
+                high,
+                low,
+                close,
+                isClosed: true,
+              });
+            }
+          } else if (c && typeof c === 'object' && c.open !== undefined) {
+            let t = Number(c.time ?? c.openTime ?? 0);
+            if (t < 1e11) t = Math.round(t * 1000);
+            candles.push({
+              asset,
+              timeframe: period,
+              openTime: Math.floor(t / (period * 1000)) * (period * 1000),
+              open: Number(c.open),
+              high: Number(c.high ?? c.open),
+              low: Number(c.low ?? c.open),
+              close: Number(c.close ?? c.open),
+              isClosed: true,
+            });
           }
         }
       }
 
-      return { asset, period, ticks };
+      if (Array.isArray(data.history)) {
+        for (const item of data.history) {
+          if (Array.isArray(item) && item.length >= 2) {
+            let time = Number(item[0]);
+            if (time < 1e11) time = Math.round(time * 1000);
+            const price = Number(item[1]);
+            if (!isNaN(price) && price > 0) {
+              ticks.push({ asset, time, price });
+            }
+          }
+        }
+      }
+
+      return { asset, period, ticks, candles: candles.length > 0 ? candles : undefined };
     }
     return null;
   }
@@ -192,6 +236,9 @@ export class QxWsParser {
   public extractPayouts(eventName: string, data: any): AssetPayout[] {
     const payouts: AssetPayout[] = [];
     if (!data) return payouts;
+    if (/deal|order|tick|quote|history|balance|auth/i.test(eventName || '')) {
+      return payouts;
+    }
 
     const list = Array.isArray(data) ? data : data.instruments || data.assets || [];
 
@@ -229,17 +276,27 @@ export class QxWsParser {
           continue;
         }
 
-        // Generic object format: { symbol, name, payout }
+        // Generic object format: { symbol, name, payout } — never confuse a deal object with an asset payout
         if (typeof item === 'object') {
+          if (
+            item.open_price !== undefined ||
+            item.openPrice !== undefined ||
+            item.close_time !== undefined ||
+            item.closeTimestamp !== undefined ||
+            item.amount !== undefined ||
+            item.open_cost !== undefined
+          ) {
+            continue;
+          }
           const asset = item.symbol || item.asset || item.name || item.id;
-          const payout = Number(item.profit_percent ?? item.payout ?? item.payment ?? item.profit);
-          if (asset && !isNaN(payout) && payout > 0) {
+          const payoutVal = QxWsParser.toPercent(item.profit_percent ?? item.payout ?? item.payment);
+          if (asset && payoutVal !== null && payoutVal > 0) {
             const name = String(item.name || asset);
             const isOtc = name.toLowerCase().includes('otc') || Boolean(item.is_otc);
             payouts.push({
               asset: normalizeAsset(asset),
               name,
-              payoutPercent: payout > 1 ? payout : payout * 100,
+              payoutPercent: payoutVal,
               isOtc,
               isActive: item.active !== false && item.enabled !== false,
             });
@@ -332,28 +389,62 @@ export class QxWsParser {
 
   /**
    * Extracts deals / trade executions.
+   * Note: In Quotex native payloads, command === 0 is CALL (UP/Buy) and command === 1 is PUT (DOWN/Sell).
    */
   public extractDeal(eventName: string, data: any): TradeDeal | null {
     if (!data || typeof data !== 'object') return null;
 
     const id = String(data.id ?? data.deal_id ?? data.ticket ?? '');
     const asset = String(data.asset ?? data.symbol ?? '');
-    const direction = String(data.dir ?? data.direction ?? data.cmd ?? '').toLowerCase();
-
     if (!id || !asset) return null;
+
+    let isCall = false;
+    if (data.command !== undefined && data.command !== null) {
+      // Quotex native numeric command: 0 = CALL (Buy/Up), 1 = PUT (Sell/Down)
+      isCall = Number(data.command) === 0 || String(data.command).toLowerCase() === 'call';
+    } else {
+      const rawDir = String(data.dir ?? data.direction ?? data.cmd ?? '').toLowerCase();
+      isCall = rawDir === 'call' || rawDir === 'up' || rawDir === '1';
+    }
+
+    const closeTs = Number(data.close_time ?? data.closeTimestamp ?? data.closeTime ?? 0);
+    const openTs = Number(data.open_time ?? data.openTimestamp ?? data.openTime ?? Date.now());
+    const rawClosePrice = data.close_price !== undefined ? Number(data.close_price) : data.closePrice !== undefined ? Number(data.closePrice) : undefined;
+    const closePrice = rawClosePrice !== undefined && rawClosePrice > 0 ? rawClosePrice : undefined;
+
+    // A newly opened Quotex binary option always carries a future closeTimestamp (scheduled expiry),
+    // a potential profit, and often initializes closePrice to the current price while ticking.
+    // Therefore, if closeTsMs is in the future (> Date.now() + 1500), it is STRICTLY OPEN
+    // unless data.isClosed === true or eventName explicitly contains 'close'.
+    const evLower = (eventName || '').toLowerCase();
+    const isExplicitOpen = evLower.includes('open') || data.isClosed === false;
+    const isExplicitClose = evLower.includes('close') || data.isClosed === true;
+    const closeTsMs = closeTs > 0 ? (closeTs > 1e11 ? closeTs : closeTs * 1000) : 0;
+    const isFutureExpiry = closeTsMs > Date.now() + 1500;
+    const isPastExpiry = closeTsMs > 0 && closeTsMs <= Date.now() + 1500;
+
+    const isTrulyClosed =
+      !isExplicitOpen &&
+      (isExplicitClose || (!isFutureExpiry && (closePrice !== undefined || (isPastExpiry && data.profit !== undefined))));
+
+    let status: 'open' | 'won' | 'lost' | 'draw' = 'open';
+    if (isTrulyClosed) {
+      const p = Number(data.profit ?? 0);
+      status = p > 0 ? 'won' : p < 0 ? 'lost' : 'draw';
+    }
 
     return {
       id,
       asset: normalizeAsset(asset),
-      direction: direction === 'call' || direction === 'up' || direction === '1' ? 'call' : 'put',
+      direction: isCall ? 'call' : 'put',
       amount: Number(data.amount ?? data.open_cost ?? 0),
-      openTime: Number(data.open_time ?? data.openTime ?? Date.now()),
-      closeTime: Number(data.close_time ?? data.closeTime ?? 0),
+      openTime: openTs,
+      closeTime: closeTs,
       openPrice: Number(data.open_price ?? data.openPrice ?? 0),
-      closePrice: data.close_price !== undefined ? Number(data.close_price) : undefined,
+      closePrice,
       profit: data.profit !== undefined ? Number(data.profit) : undefined,
       isDemo: QxWsParser.readDemoFlag(data) ?? undefined,
-      status: data.close_time ? (Number(data.profit) > 0 ? 'won' : Number(data.profit) < 0 ? 'lost' : 'draw') : 'open',
+      status,
     };
   }
 }

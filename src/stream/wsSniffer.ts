@@ -47,6 +47,33 @@ export class QxWsSniffer extends EventEmitter {
   // ── Timeframe & Expiry on chart ──
   private activeTimeframe: number = 300; // default 5m
   private activeExpiry: number = 60; // default 1m
+  private activeInvestment: number = 100;
+
+  // ── On-screen built-in indicators, drawings, sentiment & platform forecast ──
+  private activeIndicators: Array<{ id: string; type: string; period?: number; visible: boolean; settings?: any }> = [];
+  private activeDrawings: Array<{ id: string; type?: string }> = [];
+  private activeSentiment: { callPercent: number; putPercent: number } | null = null;
+  private platformSignals: Array<[number, string]> = [];
+  private openAssetTabs: Array<{ symbol: string; label: string; payout: number }> = [];
+  private storePairStats: Map<
+    string,
+    {
+      asset: string;
+      label: string;
+      type: string;
+      payout: number;
+      isOtc: boolean;
+      m5Change: number;
+      h1Change: number;
+      dayChange: number;
+    }
+  > = new Map();
+  private lastHistorySeedKey: string = '';
+  private lastHistorySeedAt: number = 0;
+
+  // ── Frame deduplication between Playwright WS and CDP ──
+  private lastFrameSig: string = '';
+  private lastFrameAt: number = 0;
 
   // ── Which account (demo / live) is open right now ──
   // Clues: the page address, the account/change + authorization messages the page sends,
@@ -55,6 +82,11 @@ export class QxWsSniffer extends EventEmitter {
   private accountMode: AccountMode = 'UNKNOWN';
   private liveBalanceValue: number | null = null;
   private demoBalanceValue: number | null = null;
+  private lastPolledUrl: string = '';
+  private lastPolledIsDemo: boolean | null = null;
+  private knownOpenDealIds: Set<string> = new Set();
+  private knownClosedDealIds: Set<string> = new Set();
+  private dealsSeeded: boolean = false;
 
   public totalFramesReceived: number = 0;
   public totalTicksReceived: number = 0;
@@ -122,15 +154,16 @@ export class QxWsSniffer extends EventEmitter {
     });
     this.setUrlMode(accountModeFromUrl(page.url()));
 
-    // Layer 3: Passive DOM poller. Reads what you can SEE on screen: which market is on the
-    // chart, its real price/payout, timeframe, account label and balance. Runs every 1.5s so
-    // any switch is picked up immediately.
-    setInterval(async () => {
+    // Layer 3: Live Platform & Screen Telemetry Poller.
+    // Reads both the rendered Quotex screen (hashed CSS module selectors) AND Quotex's live React/Redux
+    // chart store so account balance, active asset, payout, timeframe (5s..1d), expiry, built-in indicators,
+    // drawings, trader sentiment, and historical candles are synchronized in real time.
+    const pollScreenAndStore = async () => {
       try {
         if (page.isClosed()) return;
-        const dom = await page.evaluate(() => {
-          const text = (el: Element | null) => el?.textContent?.trim() || null;
-          const first = (selectors: string[]) => {
+        const dom = (await page.evaluate(`(() => {
+          const text = (el) => el?.textContent?.trim() || null;
+          const first = (selectors) => {
             for (const sel of selectors) {
               const el = document.querySelector(sel);
               if (el && text(el)) return el;
@@ -138,15 +171,53 @@ export class QxWsSniffer extends EventEmitter {
             return null;
           };
 
-          const symbolEl = first([
+          // 1. Access Quotex's live React Fiber & Redux store on .chart-container if available
+          let storeState = null;
+          let fiberProps = null;
+          try {
+            const chartContainer = document.querySelector('.chart-container') || document.querySelector('canvas');
+            const key = chartContainer
+              ? Object.keys(chartContainer).find((k) => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'))
+              : null;
+            let curr = chartContainer && key ? chartContainer[key] : null;
+            let depth = 0;
+            while (curr && depth < 20) {
+              const p = curr.memoizedProps || {};
+              if (p.symbol && p.chartPeriod !== undefined && !fiberProps) {
+                fiberProps = p;
+              }
+              if (p.value?.store && typeof p.value.store.getState === 'function') {
+                storeState = p.value.store.getState();
+                break;
+              }
+              curr = curr.return;
+              depth++;
+            }
+          } catch (e) {}
+
+          const cs = storeState?.chartSettings || null;
+          const globalSt = storeState?.global || null;
+          const activeChartId =
+            globalSt?.currentChartId ||
+            (Array.isArray(cs?.visibleChartIds) && cs.visibleChartIds[0]) ||
+            (Array.isArray(cs?.chartIds) && cs.chartIds[0]) ||
+            'graph';
+          const graph =
+            cs?.chartById?.[activeChartId] ||
+            cs?.chartById?.graph ||
+            (cs?.chartById ? Object.values(cs.chartById)[0] : null);
+          const winSettings = typeof window !== 'undefined' && window.settings ? window.settings : null;
+          const assetBySymbol = storeState?.assets?.assetBySymbol || {};
+
+          // 2. Active Asset Symbol, Label, Live Price & Authoritative On-Screen Payout
+          const dealPanelSymbolEl = first([
+            '.OmOPV .paPcy',
+            '.VyFjj',
             '.current-symbol__name',
             '[class*="current-symbol"]',
             '[class*="symbol-name"]',
             '[class*="asset-name"]',
             '.tab-item--active .tab-item__name',
-            '[class*="pair-name"]',
-            '.chart-top-panel__asset-name',
-            '[data-id="asset-name"]',
           ]);
           const priceEl = first([
             '.current-price',
@@ -156,116 +227,344 @@ export class QxWsSniffer extends EventEmitter {
             '.price-value',
           ]);
 
-          // Exact on-screen Payout (from active tab, deal form, or payout elements)
-          let payoutNum: number | null = null;
-          const activeTabEl = document.querySelector('.tab-item--active, [class*="tab--active"]');
-          if (activeTabEl && activeTabEl.textContent) {
-            const m = activeTabEl.textContent.match(/(\d{1,3})%/);
-            if (m) payoutNum = parseInt(m[1], 10);
-          }
-          if (!payoutNum) {
-            const dealFormEl = document.querySelector('[class*="deal-form"], [class*="sidebar"]');
-            if (dealFormEl && dealFormEl.textContent) {
-              const m = dealFormEl.textContent.match(/(\d{1,3})%/);
-              if (m) payoutNum = parseInt(m[1], 10);
-            }
-          }
-          if (!payoutNum) {
-            const pEl = first([
-              '[class*="payout-percent"]',
-              '[class*="profit-percent"]',
-              '[class*="deal-form__payout"]',
-              '.payout-value',
-            ]);
-            if (pEl && pEl.textContent) {
-              const m = pEl.textContent.match(/(\d{1,3})/);
-              if (m) payoutNum = parseInt(m[1], 10);
-            }
-          }
+          const domPairText = text(dealPanelSymbolEl);
+          const visibleSym = Array.isArray(cs?.visibleSymbols) && cs.visibleSymbols[0] ? cs.visibleSymbols[0] : null;
+          let storeSymbol = visibleSym || graph?.currentAsset?.symbol || fiberProps?.symbol || null;
 
-          // Candle timeframe from left toolbar / chart header (e.g. 5m, 1m, 30s, 10s, 1h)
-          let chartTfSec = 300;
-          const tfButtons = Array.from(document.querySelectorAll('button, [class*="timeframe"], .chart-sidebar button, .chart-top-panel button'));
-          for (const btn of tfButtons) {
-            const t = (btn.textContent || '').trim().toLowerCase();
-            const match = t.match(/^(5s|10s|15s|30s|1m|2m|5m|10m|15m|30m|1h|4h|1d)$/);
-            if (match) {
-              const isSelected = btn.classList.contains('active') || btn.classList.contains('selected') || btn.getAttribute('aria-selected') === 'true';
-              if (isSelected) {
-                const val = parseInt(match[1].slice(0, -1), 10);
-                const unit = match[1].slice(-1);
-                chartTfSec = unit === 's' ? val : unit === 'm' ? val * 60 : unit === 'h' ? val * 3600 : val * 86400;
+          // If the visible Deal Panel pair text (e.g. "EUR/GBP (OTC)" or "USD/JPY") is present,
+          // match it against assetBySymbol so the visible pair on screen ALWAYS wins!
+          if (domPairText) {
+            const normText = domPairText.replace(/\\s+/g, ' ').trim().toLowerCase();
+            for (const symKey of Object.keys(assetBySymbol)) {
+              const a = assetBySymbol[symKey];
+              if (
+                a &&
+                (String(a.label || '').trim().toLowerCase() === normText ||
+                  String(a.symbol || '').trim().toLowerCase() === normText)
+              ) {
+                storeSymbol = a.symbol || symKey;
                 break;
               }
             }
+            if (!storeSymbol) {
+              storeSymbol = domPairText;
+            }
           }
 
-          // Trade expiry duration from deal form (e.g. "00:01:00" -> 60s)
-          let expirySec = 60;
-          const timeInputs = Array.from(document.querySelectorAll('[class*="deal-form"] input, [class*="deal-form"] [class*="time"]'));
+          const liveAssetObj = (storeSymbol && assetBySymbol[storeSymbol]) || graph?.currentAsset?.obj || null;
+          const storeLabel = domPairText || liveAssetObj?.label || storeSymbol;
+
+          // Live quote price from store quotes dictionary or currentAsset
+          const quoteObj = storeSymbol && storeState?.quotes?.quoteBySymbol ? storeState.quotes.quoteBySymbol[storeSymbol] : null;
+          const storePrice =
+            typeof quoteObj?.price === 'number'
+              ? quoteObj.price
+              : typeof graph?.currentAsset?.price === 'number' && graph?.currentAsset?.symbol === storeSymbol
+              ? graph.currentAsset.price
+              : null;
+
+          // Authoritative Payout:
+          // Priority 1: Visible Deal Panel payout element (.OmOPV .eB25d or .UI2Kh)
+          // Priority 2: Deal Panel dollar return calculation ((Payout$ - Investment$) / Investment$)
+          // Priority 3: Live assetBySymbol[storeSymbol].payout in Redux
+          let payoutNum = null;
+          const pEl = first([
+            '.OmOPV .eB25d',
+            '.UI2Kh',
+            '[class*="payout-percent"]',
+            '[class*="profit-percent"]',
+            '[class*="deal-form__payout"]',
+            '.payout-value',
+          ]);
+          if (pEl && pEl.textContent) {
+            const m = pEl.textContent.match(/(\\d{1,3})\\s*%/);
+            if (m) {
+              const parsed = parseInt(m[1], 10);
+              if (parsed >= 10 && parsed <= 99) payoutNum = parsed;
+            }
+          }
+          if (!payoutNum) {
+            const payoutDollarText = text(document.querySelector('.omlQ2 b, .w7PIC b'));
+            const invAmt = typeof graph?.dealValue === 'number' && graph.dealValue > 0 ? graph.dealValue : null;
+            if (payoutDollarText && invAmt) {
+              const pDol = parseFloat(payoutDollarText.replace(/[^0-9.]/g, ''));
+              if (!isNaN(pDol) && pDol > invAmt) {
+                const calcPct = Math.round(((pDol - invAmt) / invAmt) * 100);
+                if (calcPct >= 10 && calcPct <= 99) payoutNum = calcPct;
+              }
+            }
+          }
+          if (!payoutNum && typeof liveAssetObj?.payout === 'number' && liveAssetObj.payout > 0) {
+            payoutNum = liveAssetObj.payout;
+          }
+
+          // 3. Candle Timeframe (e.g. 5s, 10s, 15s, 30s, 1m, 2m, 5m, 10m, 15m, 30m, 1h, 4h, 1d)
+          // Primary source: the visible timeframe control in .NDbAT .HgaSf at bottom-left of chart
+          const periodCodeMap = {
+            1: 5,
+            2: 10,
+            3: 15,
+            4: 60,
+            5: 120,
+            6: 300,
+            7: 600,
+            8: 900,
+            9: 1800,
+            10: 3600,
+            11: 14400,
+            12: 86400,
+            13: 30,
+          };
+          const parseTfLabel = (str) => {
+            if (!str) return null;
+            const m = str.trim().toLowerCase().match(/^(5s|10s|15s|30s|1m|2m|5m|10m|15m|30m|1h|4h|1d)$/);
+            if (!m) return null;
+            const val = parseInt(m[1].slice(0, -1), 10);
+            const unit = m[1].slice(-1);
+            return unit === 's' ? val : unit === 'm' ? val * 60 : unit === 'h' ? val * 3600 : val * 86400;
+          };
+
+          let chartTfSec = null;
+          const tfCandidates = Array.from(document.querySelectorAll('.NDbAT .HgaSf, .NDbAT div, button, [class*="timeframe"]'));
+          for (const el of tfCandidates) {
+            const parsed = parseTfLabel(el.textContent || '');
+            if (parsed) {
+              chartTfSec = parsed;
+              break;
+            }
+          }
+          if (!chartTfSec && graph?.chartPeriod && periodCodeMap[graph.chartPeriod]) {
+            chartTfSec = periodCodeMap[graph.chartPeriod];
+          }
+          if (!chartTfSec) chartTfSec = 300;
+
+          // 4. Trade Expiry Duration (from store timePeriod or right-side Time input e.g. "00:01:00" or "05:00")
+          let expirySec = typeof graph?.timePeriod === 'number' && graph.timePeriod > 0 ? graph.timePeriod : null;
+          const timeInputs = Array.from(document.querySelectorAll('input.input-control__input, [class*="deal-form"] input'));
           for (const el of timeInputs) {
-            const val = (el as HTMLInputElement).value || el.textContent || '';
-            const match = val.match(/(\d{2}):(\d{2}):(\d{2})/);
-            if (match) {
-              const hrs = parseInt(match[1], 10);
-              const mins = parseInt(match[2], 10);
-              const secs = parseInt(match[3], 10);
-              const total = hrs * 3600 + mins * 60 + secs;
+            const val = (el.value || el.textContent || '').trim();
+            const m3 = val.match(/^(\\d{2}):(\\d{2}):(\\d{2})$/);
+            if (m3) {
+              const total = parseInt(m3[1], 10) * 3600 + parseInt(m3[2], 10) * 60 + parseInt(m3[3], 10);
               if (total > 0) {
                 expirySec = total;
                 break;
               }
             }
           }
+          if (!expirySec) expirySec = 60;
 
-          // Account label & exact balance from header
-          const labelTexts = Array.from(document.querySelectorAll('[class*="account"], [class*="balance"], header'))
-            .map((el) => (el.textContent || '').replace(/\s+/g, ' ').trim())
-            .filter((t) => t.length > 0 && t.length < 100);
-          const joined = labelTexts.join(' | ');
-          const sawDemo = /demo|practice/i.test(joined);
-          const sawLive = /live account|real account|\blive\b/i.test(joined);
+          // Investment stake
+          let dealAmount = typeof graph?.dealValue === 'number' ? graph.dealValue : 100;
 
-          let balanceMatch: string | null = null;
-          const headerEl = document.querySelector('header, [class*="header"], [class*="usermenu"]');
-          if (headerEl) {
-            const hText = headerEl.textContent || '';
-            const m = hText.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
-            if (m) balanceMatch = m[1];
+          // 5. Account Mode (DEMO vs LIVE) and Balances
+          let isDemoFlag = null;
+          // Check visible top-right account label first, then Redux global state
+          const bodyUpper = (document.body?.innerText || '').slice(0, 1200);
+          if (/LIVE\s+ACCOUNT|REAL\s+ACCOUNT/i.test(bodyUpper) && !/DEMO\s+ACCOUNT/i.test(bodyUpper)) {
+            isDemoFlag = false;
+          } else if (/DEMO\s+ACCOUNT/i.test(bodyUpper) && !/LIVE\s+ACCOUNT|REAL\s+ACCOUNT/i.test(bodyUpper)) {
+            isDemoFlag = true;
+          } else if (globalSt?.activeAccount) {
+            isDemoFlag = String(globalSt.activeAccount).toLowerCase() === 'demo';
+          } else if (typeof globalSt?.isDemo === 'boolean') {
+            isDemoFlag = globalSt.isDemo;
+          } else if (winSettings?.isDemo !== undefined) {
+            isDemoFlag = Boolean(Number(winSettings.isDemo));
           }
-          if (!balanceMatch) {
-            const balanceEl = first(['[class*="balance"] [class*="value"]', '[class*="balance__value"]', '[class*="balance"]']);
-            const m = (text(balanceEl) || '').match(/([\d.,]+)/);
-            if (m) balanceMatch = m[1];
+
+          const demoBalanceNum =
+            typeof globalSt?.demoBalance === 'number'
+              ? globalSt.demoBalance
+              : winSettings?.demoBalance !== undefined
+              ? parseFloat(String(winSettings.demoBalance))
+              : null;
+          const liveBalanceNum =
+            typeof globalSt?.liveBalance === 'number'
+              ? globalSt.liveBalance
+              : winSettings?.liveBalance !== undefined
+              ? parseFloat(String(winSettings.liveBalance))
+              : null;
+
+          // 6. Active Built-in Indicators & Drawings on Chart
+          const indicatorsList = [];
+          const indById = storeState?.indicators?.byId || {};
+          for (const id of Object.keys(indById)) {
+            const ind = indById[id];
+            if (ind) {
+              indicatorsList.push({
+                id: ind.id || id,
+                type: ind.type || 'unknown',
+                period: ind.settings?.period,
+                visible: ind.visible !== false && ind.settings?.isVisibility !== false,
+                settings: ind.settings,
+              });
+            }
           }
+
+          const drawingsList = [];
+          const drawById = storeState?.drawings?.byId || {};
+          for (const id of Object.keys(drawById)) {
+            const d = drawById[id];
+            if (d) drawingsList.push({ id: d.id || id, type: d.type || d.name || 'drawing' });
+          }
+
+          // 7. Live Trader Sentiment bar (left side of chart: ._ImZx / .qXmSx)
+          let sentiment = null;
+          const s1 = text(document.querySelector('._ImZx'));
+          const s2 = text(document.querySelector('.qXmSx'));
+          if (s1 && s2) {
+            const p1 = parseInt(s1, 10);
+            const p2 = parseInt(s2, 10);
+            if (!isNaN(p1) && !isNaN(p2)) {
+              sentiment = { putPercent: p1, callPercent: p2 };
+            }
+          }
+
+          // 8. Open Asset Tabs & All Active Asset Payouts (with Forex trend stats)
+          const openTabs = Array.from(document.querySelectorAll('.H4wMV')).map((el) => {
+            const nameText = text(el.querySelector('.WRocw')) || '';
+            const payText = text(el.querySelector('.ElyTP')) || '';
+            const pm = payText.match(/(\\d{1,3})/);
+            return {
+              symbol: nameText,
+              label: nameText,
+              payout: pm ? parseInt(pm[1], 10) : 0,
+            };
+          });
+
+          const allStorePayouts = [];
+          for (const sym of Object.keys(assetBySymbol)) {
+            const a = assetBySymbol[sym];
+            if (a && a.active && typeof a.payout === 'number' && a.payout > 0) {
+              allStorePayouts.push({
+                symbol: a.symbol || sym,
+                label: a.label || sym,
+                type: a.type || 'currency',
+                payout: a.payout,
+                payout1: a.payout_1,
+                payout5: a.payout_5,
+                isOtc: Boolean(a.is_otc),
+                m5Change: typeof a.m5_change === 'number' ? a.m5_change : 0,
+                h1Change: typeof a.h1_change === 'number' ? a.h1_change : 0,
+                dayChange: typeof a.day_change === 'number' ? a.day_change : 0,
+              });
+            }
+          }
+
+          // 9. Active Open Deals & Newly Closed Deals from Redux Store
+          const openedById = storeState?.deals?.openedById || {};
+          const closedById = storeState?.deals?.closedById || {};
+          const closedIds = Array.isArray(storeState?.deals?.closedIds) ? storeState.deals.closedIds.slice(0, 10) : [];
+          const openedDealsList = Object.values(openedById);
+          const recentClosedList = closedIds.map((cid) => closedById[cid]).filter(Boolean);
+
+          // 10. History points for the active chart (verified against storePrice so tab switches never mix history)
+          const rawHistory = Array.isArray(graph?.historyPoints)
+            ? graph.historyPoints
+            : Array.isArray(fiberProps?.historyPoints)
+            ? fiberProps.historyPoints
+            : [];
+          const lastPt = rawHistory.length > 0 ? rawHistory[rawHistory.length - 1] : null;
+          const historyVerified =
+            lastPt &&
+            typeof lastPt.value === 'number' &&
+            typeof storePrice === 'number' &&
+            storePrice > 0 &&
+            Math.abs(lastPt.value - storePrice) / storePrice < 0.02;
+          const fullHistory = historyVerified ? rawHistory : [];
+          const serverTimeMs =
+            lastPt && typeof lastPt.time === 'number'
+              ? lastPt.time > 1e11
+                ? Math.round(lastPt.time)
+                : Math.round(lastPt.time * 1000)
+              : typeof globalSt?.currentTime === 'number'
+              ? globalSt.currentTime * 1000
+              : Date.now();
 
           return {
             url: window.location.href,
-            symbol: text(symbolEl),
-            price: text(priceEl),
+            symbol: storeSymbol || domPairText,
+            label: storeLabel || domPairText,
+            price: storePrice !== null ? String(storePrice) : text(priceEl),
+            serverTimeMs,
             payout: payoutNum,
             chartTfSec,
             expirySec,
-            balance: balanceMatch,
-            labelMode: sawDemo && !sawLive ? 'DEMO' : sawLive && !sawDemo ? 'LIVE' : 'UNKNOWN',
+            dealAmount,
+            isDemoFlag,
+            demoBalanceNum,
+            liveBalanceNum,
+            indicatorsList,
+            drawingsList,
+            sentiment,
+            platformSignals: Array.isArray(liveAssetObj?.signals) ? liveAssetObj.signals : [],
+            openTabs,
+            allStorePayouts,
+            openedDealsList,
+            recentClosedList,
+            historyPoints: fullHistory,
           };
-        });
+        })()`)) as any;
 
-        // ── Account & Balance ──
-        this.setUrlMode(accountModeFromUrl(dom.url));
-        this.tracker.update('screen label', dom.labelMode as AccountMode);
+        // ── Account & Balance (Only update URL mode when URL actually changes!) ──
+        if (dom.url && dom.url !== this.lastPolledUrl) {
+          this.lastPolledUrl = dom.url;
+          this.setUrlMode(accountModeFromUrl(dom.url));
+        }
+        if (typeof dom.isDemoFlag === 'boolean') {
+          const detectedMode: AccountMode = dom.isDemoFlag ? 'DEMO' : 'LIVE';
+          if (this.lastPolledIsDemo !== dom.isDemoFlag || this.accountMode !== detectedMode) {
+            this.lastPolledIsDemo = dom.isDemoFlag;
+            this.tracker.update('Quotex request', detectedMode);
+          }
+        }
         this.refreshAccountMode();
 
-        if (dom.balance) {
-          const balNum = parseFloat(dom.balance.replace(/,/g, ''));
-          if (!isNaN(balNum)) {
-            if (this.accountMode === 'LIVE') this.liveBalanceValue = balNum;
-            else if (this.accountMode === 'DEMO') this.demoBalanceValue = balNum;
-            this.updateBalance(balNum, 'USD');
+        if (typeof dom.demoBalanceNum === 'number' && !isNaN(dom.demoBalanceNum)) {
+          this.demoBalanceValue = dom.demoBalanceNum;
+        }
+        if (typeof dom.liveBalanceNum === 'number' && !isNaN(dom.liveBalanceNum)) {
+          this.liveBalanceValue = dom.liveBalanceNum;
+        }
+        this.refreshBalanceForMode();
+
+        // ── Process Store Deals (Guarantees open trades stay OPEN until truly settled in closedById) ──
+        if (!this.dealsSeeded && Array.isArray(dom.recentClosedList) && dom.recentClosedList.length > 0) {
+          this.dealsSeeded = true;
+          for (const cd of dom.recentClosedList) {
+            if (cd?.id) this.knownClosedDealIds.add(String(cd.id));
+          }
+        }
+        if (Array.isArray(dom.openedDealsList)) {
+          for (const od of dom.openedDealsList) {
+            if (od?.id && !this.knownOpenDealIds.has(String(od.id))) {
+              this.knownOpenDealIds.add(String(od.id));
+              const openDeal = this.parser.extractDeal('deals/open', { ...od, isClosed: false });
+              if (openDeal) {
+                openDeal.status = 'open';
+                this.emit('deal', openDeal);
+              }
+            }
+          }
+        }
+        if (this.dealsSeeded && Array.isArray(dom.recentClosedList)) {
+          for (const cd of dom.recentClosedList) {
+            const cid = cd?.id ? String(cd.id) : '';
+            // Only emit a settled deal if we saw it open during this session (never replay old history!)
+            if (cid && !this.knownClosedDealIds.has(cid) && this.knownOpenDealIds.has(cid)) {
+              this.knownClosedDealIds.add(cid);
+              const closedDeal = this.parser.extractDeal('deals/close', { ...cd, isClosed: true });
+              if (closedDeal && closedDeal.status !== 'open') {
+                this.emit('deal', closedDeal);
+              }
+            } else if (cid && !this.knownClosedDealIds.has(cid)) {
+              this.knownClosedDealIds.add(cid);
+            }
           }
         }
 
-        // ── Timeframe & Expiry ──
+        // ── Timeframe, Expiry & Investment ──
         if (dom.chartTfSec && dom.chartTfSec !== this.activeTimeframe) {
           const prevTf = this.activeTimeframe;
           this.activeTimeframe = dom.chartTfSec;
@@ -274,13 +573,56 @@ export class QxWsSniffer extends EventEmitter {
         if (dom.expirySec) {
           this.activeExpiry = dom.expirySec;
         }
+        if (typeof dom.dealAmount === 'number' && dom.dealAmount > 0) {
+          this.activeInvestment = dom.dealAmount;
+        }
+
+        // ── Indicators, Drawings, Sentiment & Platform Signals ──
+        if (Array.isArray(dom.indicatorsList)) this.activeIndicators = dom.indicatorsList;
+        if (Array.isArray(dom.drawingsList)) this.activeDrawings = dom.drawingsList;
+        if (dom.sentiment) this.activeSentiment = dom.sentiment;
+        if (Array.isArray(dom.platformSignals)) this.platformSignals = dom.platformSignals;
+        if (Array.isArray(dom.openTabs)) this.openAssetTabs = dom.openTabs;
+
+        // ── Sync All Store Asset Payouts & Forex Pair Stats ──
+        if (Array.isArray(dom.allStorePayouts) && dom.allStorePayouts.length > 0) {
+          const now = Date.now();
+          for (const sp of dom.allStorePayouts) {
+            const cleanSym = normalizeAsset(sp.symbol);
+            this.registry.learn(cleanSym, sp.label);
+            const onScreen = this.onScreenPayouts.get(cleanSym);
+            const authoritativePayout = onScreen && now - onScreen.at < 60000 ? onScreen.payout : sp.payout;
+            this.assetPayouts.set(cleanSym, {
+              asset: cleanSym,
+              name: sp.label,
+              payoutPercent: authoritativePayout,
+              payout1mPercent: sp.payout1,
+              payout5mPercent: sp.payout5,
+              isOtc: sp.isOtc,
+              isActive: true,
+            });
+            this.storePairStats.set(cleanSym, {
+              asset: cleanSym,
+              label: sp.label,
+              type: sp.type || 'currency',
+              payout: this.activeTimeframe >= 300 && sp.payout5 ? sp.payout5 : authoritativePayout,
+              isOtc: sp.isOtc,
+              m5Change: sp.m5Change || 0,
+              h1Change: sp.h1Change || 0,
+              dayChange: sp.dayChange || 0,
+            });
+          }
+        }
 
         // ── Market on chart ──
-        const resolved = dom.symbol ? this.registry.resolve(dom.symbol) : '';
-        const priceNum = dom.price ? parseFloat(dom.price.replace(/[^0-9.]/g, '')) : NaN;
+        if (dom.symbol && dom.label) {
+          this.registry.learn(dom.symbol, dom.label);
+        }
+        const resolved = dom.symbol ? normalizeAsset(dom.symbol) : '';
+        const priceNum = dom.price ? parseFloat(String(dom.price).replace(/[^0-9.]/g, '')) : NaN;
 
         let screenAsset = '';
-        if (resolved && (this.registry.isKnown(resolved) || this.latestTicks.has(resolved))) {
+        if (resolved) {
           screenAsset = resolved;
         } else if (!isNaN(priceNum) && priceNum > 0) {
           screenAsset = this.matchAssetByPrice(priceNum);
@@ -298,7 +640,7 @@ export class QxWsSniffer extends EventEmitter {
           if (!existing || existing.payoutPercent !== dom.payout) {
             this.assetPayouts.set(clean, {
               asset: clean,
-              name: dom.symbol || clean,
+              name: dom.label || dom.symbol || clean,
               payoutPercent: dom.payout,
               isOtc: clean.endsWith('_OTC'),
               isActive: true,
@@ -307,18 +649,38 @@ export class QxWsSniffer extends EventEmitter {
           }
         }
 
-        // Fall back to screen-scraped prices if stream goes quiet
+        // ── Seed Chart Historical Candles Immediately From Screen (Verified & Isolated per Asset + Timeframe) ──
+        if (screenAsset && Array.isArray(dom.historyPoints) && dom.historyPoints.length > 20) {
+          const seedKey = `${screenAsset}_${this.activeTimeframe}`;
+          if (seedKey !== this.lastHistorySeedKey || Date.now() - this.lastHistorySeedAt > 4000) {
+            this.lastHistorySeedKey = seedKey;
+            this.lastHistorySeedAt = Date.now();
+            this.emit('chartHistoryPoints', {
+              asset: screenAsset,
+              timeframe: this.activeTimeframe,
+              points: dom.historyPoints,
+            });
+          }
+        }
+
+        // ── Live Quote Tick Update (using Quotex server timestamp to stay aligned with chart candles) ──
         if (screenAsset && !isNaN(priceNum) && priceNum > 0) {
           const lastWs = this.lastTickAt.get(screenAsset) ?? 0;
-          if (Date.now() - lastWs > 4000) {
-            const tick: Tick = { asset: screenAsset, time: Date.now(), price: priceNum };
+          const prevPrice = this.latestTicks.get(screenAsset)?.price;
+          if (Date.now() - lastWs > 1500 || prevPrice !== priceNum) {
+            const tickTime = typeof dom.serverTimeMs === 'number' && dom.serverTimeMs > 0 ? dom.serverTimeMs : Date.now();
+            const tick: Tick = { asset: screenAsset, time: tickTime, price: priceNum };
             this.recordTick(tick);
           }
         }
       } catch {
         // Page navigation or closed cleanly
       }
-    }, 1500);
+    };
+
+    // Run once immediately and then every 1.2s
+    await pollScreenAndStore();
+    setInterval(pollScreenAndStore, 1200);
   }
 
   // ───────────────────────── account mode ─────────────────────────
@@ -428,6 +790,15 @@ export class QxWsSniffer extends EventEmitter {
   }
 
   public handleIncomingFrame(payload: string | Buffer): void {
+    const rawStr = typeof payload === 'string' ? payload : payload.toString('utf-8');
+    const sig = rawStr.length > 120 ? `${rawStr.length}:${rawStr.slice(0, 60)}:${rawStr.slice(-40)}` : rawStr;
+    const now = Date.now();
+    if (sig === this.lastFrameSig && now - this.lastFrameAt < 15) {
+      return; // Deduplicate identical consecutive frame received from both Playwright WS and CDP
+    }
+    this.lastFrameSig = sig;
+    this.lastFrameAt = now;
+
     this.totalFramesReceived++;
     const parsed = this.parser.parseFrame(payload);
     if (!parsed) return;
@@ -554,5 +925,94 @@ export class QxWsSniffer extends EventEmitter {
 
   public getActiveExpiry(): number {
     return this.activeExpiry;
+  }
+
+  public getActiveInvestment(): number {
+    return this.activeInvestment;
+  }
+
+  public getOnScreenIndicators(): Array<{ id: string; type: string; period?: number; visible: boolean; settings?: any }> {
+    return this.activeIndicators;
+  }
+
+  public getOnScreenDrawings(): Array<{ id: string; type?: string }> {
+    return this.activeDrawings;
+  }
+
+  public getSentiment(): { callPercent: number; putPercent: number } | null {
+    return this.activeSentiment;
+  }
+
+  /**
+   * Returns Quotex's own internal platform directional signal for the nearest matching expiry (if available).
+   */
+  public getPlatformSignal(timeframeSeconds?: number): 'CALL' | 'PUT' | null {
+    if (!this.platformSignals || this.platformSignals.length === 0) return null;
+    const target = timeframeSeconds || this.activeTimeframe || 300;
+    let bestDir: string | null = null;
+    let bestDiff = Infinity;
+    for (const entry of this.platformSignals) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const tf = Number(entry[0]);
+        const dir = String(entry[1]).toLowerCase();
+        const diff = Math.abs(tf - target);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestDir = dir;
+        }
+      }
+    }
+    if (bestDir === 'call' || bestDir === 'up') return 'CALL';
+    if (bestDir === 'put' || bestDir === 'down') return 'PUT';
+    return null;
+  }
+
+  public getOpenAssetTabs(): Array<{ symbol: string; label: string; payout: number }> {
+    return this.openAssetTabs;
+  }
+
+  /**
+   * Ranks and returns the top alternative Forex pairs when the current pair is choppy or low-payout.
+   * Prioritizes currency pairs with high payout (>= 84%) and aligned M5 + H1 directional momentum.
+   */
+  public getRecommendedAlternativePairs(
+    currentAsset: string,
+    limit: number = 3
+  ): Array<{
+    asset: string;
+    label: string;
+    payout: number;
+    m5Change: number;
+    h1Change: number;
+    trendBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  }> {
+    const cleanCurrent = normalizeAsset(currentAsset);
+    const candidates = Array.from(this.storePairStats.values()).filter(
+      (p) => p.asset !== cleanCurrent && p.payout >= 82 && (p.type === 'currency' || !p.type)
+    );
+
+    const scored = candidates.map((p) => {
+      const sameSign = (p.m5Change > 0 && p.h1Change > 0) || (p.m5Change < 0 && p.h1Change < 0);
+      const momentumScore = Math.abs(p.m5Change) * 15 + Math.abs(p.h1Change) * 5 + (sameSign ? 10 : 0);
+      const totalScore = p.payout + Math.min(25, momentumScore);
+      const trendBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
+        p.m5Change > 0.03 && p.h1Change >= 0
+          ? 'BULLISH'
+          : p.m5Change < -0.03 && p.h1Change <= 0
+          ? 'BEARISH'
+          : 'NEUTRAL';
+      return {
+        asset: p.asset,
+        label: p.label,
+        payout: p.payout,
+        m5Change: p.m5Change,
+        h1Change: p.h1Change,
+        trendBias,
+        totalScore,
+      };
+    });
+
+    scored.sort((a, b) => b.totalScore - a.totalScore);
+    return scored.slice(0, limit);
   }
 }
