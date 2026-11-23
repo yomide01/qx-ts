@@ -1,22 +1,26 @@
 {
   "name": "qx-ts",
-  "version": "1.0.0",
-  "description": "Quotex Semi-Automated Trading Assistant & Stream Watcher",
+  "version": "2.0.0",
+  "description": "Quotex Analytics, Backtester & Semi-Automated / Automated Trading Assistant",
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
     "journal:report": "tsx src/journal/report.ts",
-    "test": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/analysis/signalEngine.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts && tsx src/stream/parser.test.ts && tsx src/journal/journal.test.ts",
-    "test:unit": "tsx src/stream/assets.test.ts && tsx src/analysis/binaryMath.test.ts && tsx src/analysis/signalEngine.test.ts && tsx src/stream/account.test.ts && tsx src/ui/statusLine.test.ts && tsx src/stream/parser.test.ts && tsx src/journal/journal.test.ts"
+    "backtest": "tsx src/analysis/backtester.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "test:unit": "node --import tsx --test src/**/*.test.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@types/node": "^26.6.6",
     "dotenv": "^18.0.10",
-    "playwright": "^1.65.1",
+    "playwright": "^1.65.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

@@ -1,13 +1,30 @@
 import { Candle } from '../stream/types.js';
 import { TradeRecord, IndicatorSnapshot } from '../journal/types.js';
-import { TechnicalIndicators } from './indicators.js';
-import { breakevenWinRate, wilsonInterval } from './binaryMath.js';
+import { TechnicalIndicators, BollingerBandsResult, CandleWickAnalysis } from './indicators.js';
+import {
+  breakevenWinRate,
+  wilsonInterval,
+  bonferroniZ,
+  binomialOneSidedPValue,
+  empiricalBayesWinRate,
+  expectedValuePerDollar,
+  halfKellyFraction,
+} from './binaryMath.js';
 import { VisualChartAnalysis } from './visualChartEngine.js';
 
 export type AdaptiveStrategyMode = 'TREND_PULLBACK' | 'MEAN_REVERSION_BB' | 'BREAKOUT_MOMENTUM' | 'WAIT_NO_EDGE';
 export type PlaybookName = 'EMA_PULLBACK_SNIPER' | 'MOMENTUM_CHANNEL' | 'STREAK_EXHAUSTION_FADE' | 'NONE';
 export type IndicatorProfileName = 'FAST' | 'STANDARD' | 'SMOOTH';
 export type MarketRegimeKind = 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY';
+export type CalibrationTier = 'PROVEN_EDGE' | 'PRELIMINARY' | 'NO_EDGE';
+
+/** Plain, non-hyped labels for user-facing output. */
+export const PLAYBOOK_DISPLAY_NAMES: Record<PlaybookName, string> = {
+  EMA_PULLBACK_SNIPER: 'EMA Pullback',
+  MOMENTUM_CHANNEL: 'Momentum Channel',
+  STREAK_EXHAUSTION_FADE: 'Exhaustion Fade',
+  NONE: 'None',
+};
 
 export interface IndicatorProfile {
   name: IndicatorProfileName;
@@ -25,21 +42,57 @@ export const INDICATOR_PROFILES: Record<IndicatorProfileName, IndicatorProfile> 
   SMOOTH: { name: 'SMOOTH', emaFast: 12, emaSlow: 26, rsiPeriod: 14, bbPeriod: 20, bbDev: 2.2, stochK: 14 },
 };
 
+export const ALL_PLAYBOOKS: PlaybookName[] = [
+  'EMA_PULLBACK_SNIPER',
+  'MOMENTUM_CHANNEL',
+  'STREAK_EXHAUSTION_FADE',
+];
+
+export const ALL_PROFILES: IndicatorProfile[] = [
+  INDICATOR_PROFILES.FAST,
+  INDICATOR_PROFILES.STANDARD,
+  INDICATOR_PROFILES.SMOOTH,
+];
+
 export interface PlaybookStats {
   playbook: PlaybookName;
   profile: IndicatorProfile;
-  horizonCandles: number; // 1, 2, or 3 candles ("how long price stays up/down")
+  horizonCandles: number;
   trainWins: number;
   trainLosses: number;
   trainWinRate: number;
-  oosWins: number; // Out-of-Sample (unseen recent 35% of candles)
+  trainWilsonLowBonf: number; // Bonferroni-corrected Wilson lower bound on train set
+  trainPValueBonf: number; // Multiple-testing adjusted train p-value
+  oosWins: number; // STRICTLY UNTOUCHED holdout (never used to rank/select candidates!)
   oosLosses: number;
   oosWinRate: number;
+  oosWilsonLow95: number; // 95% Wilson lower bound on untouched OOS
+  oosWilsonHigh95: number; // 95% Wilson upper bound on untouched OOS
+  oosWilsonLow1Sigma: number; // 1-sigma (~84% one-sided) Wilson lower bound on untouched OOS
+  oosPValue: number; // Exact one-sided binomial p-value vs break-even on untouched OOS
+  estimatedWinRate: number; // Empirical Bayes shrunk probability (pulled toward 50% coin flip)
+  expectedValuePerDollar: number; // EV per $1 staked using shrunk win probability
+  rawOosEvPerDollar: number; // EV per $1 staked using raw untouched OOS win rate
+  halfKelly: number; // Conservative half-Kelly bankroll fraction (capped at 2%)
+  candidatesTested: number; // K = number of variants searched during training selection
   totalWins: number;
   totalLosses: number;
-  winRate: number; // 0-100
-  wilsonLowerBound: number; // Conservative lower confidence bound (shrinks small samples)
-  edgeAboveBreakeven: number; // percentage points above break-even
+  winRate: number; // Combined (informational only — never used for gating!)
+  wilsonLowerBound: number; // Untouched OOS 95% Wilson lower bound
+  edgeAboveBreakeven: number; // Untouched OOS win rate minus break-even (percentage points)
+}
+
+export interface CalibrationOptions {
+  /** If true (required for unproven LIVE safety gate), only PROVEN_EDGE passes isTradeable. */
+  strictProvenOnly?: boolean;
+  /** Fraction of history reserved strictly for candidate selection (default 0.60). */
+  trainFraction?: number;
+  /** Minimum training trades required for a candidate to be eligible (default 5). */
+  minTrainTrades?: number;
+  /** Minimum untouched OOS trades required for PRELIMINARY tier (default 4). PROVEN_EDGE always needs >= 30. */
+  minOosTrades?: number;
+  /** Minimum payout % to allow trading (default 80). */
+  minPayoutPercent?: number;
 }
 
 export interface PairCalibrationReport {
@@ -47,11 +100,13 @@ export interface PairCalibrationReport {
   payoutPercent: number;
   timeframeSeconds: number;
   candlesTested: number;
+  tier: CalibrationTier;
   bestPlaybook: PlaybookName;
   bestProfile: IndicatorProfile;
   recommendedHorizonCandles: number;
   recommendedExpirySeconds: number;
   bestStats: PlaybookStats | null;
+  candidatesTested: number;
   whipsawRatio: number;
   isTradeable: boolean;
   shouldRemovePair: boolean;
@@ -63,9 +118,11 @@ export interface AdaptivePairIntelligence {
   isOtc: boolean;
   strategyMode: AdaptiveStrategyMode;
   activePlaybook: PlaybookName;
+  playbookLabel: string;
   activeProfile: IndicatorProfile;
   recommendedExpirySeconds: number;
   calibration: PairCalibrationReport;
+  calibrationTier: CalibrationTier;
   marketRegime: MarketRegimeKind;
   indicatorsAtEntry: IndicatorSnapshot;
   efficiencyRatio: number;
@@ -73,90 +130,223 @@ export interface AdaptivePairIntelligence {
   volatilityState: 'DEAD_SQUEEZE' | 'HEALTHY' | 'ERRATIC_SPIKE';
   directionCall: 'CALL' | 'PUT' | 'WAIT';
   callLabel: string;
-  convictionScore: number; // 0-100 confluence score
-  alignedPillars: number; // out of 5 indicator pillars
-  totalPillars: number; // 5
+  /** Honest Empirical Bayes shrunk win probability (0-100), NOT a hardcoded conviction score. */
+  estimatedWinProb: number;
+  /** Expected value per $1 staked based on shrunk win probability and live payout. */
+  expectedValuePerDollar: number;
+  /** Alias for estimatedWinProb (stored in DB signal_confidence for backwards compatibility). */
+  convictionScore: number;
+  alignedPillars: number;
+  totalPillars: number;
   shouldSwitchPair: boolean;
   switchReason?: string;
   factors: string[];
   journalEdgeSummary?: string;
 }
 
-interface PlaybookSignalResult {
+export interface PlaybookSignalResult {
   direction: 'CALL' | 'PUT';
   alignedPillars: number;
-  score: number;
   reasons: string[];
+}
+
+/**
+ * O(N) precomputed indicator arrays aligned to candle indices [0..N-1] for a given profile.
+ * Eliminates the O(N^2) slicing bottleneck during calibration and multi-thousand-bar backtests.
+ */
+export interface PrecomputedProfileSeries {
+  candles: Candle[];
+  profile: IndicatorProfile;
+  minNeeded: number;
+  emaFast: (number | undefined)[];
+  emaSlow: (number | undefined)[];
+  rsi: (number | undefined)[];
+  stochK: (number | undefined)[];
+  stochD: (number | undefined)[];
+  bbMain: (BollingerBandsResult | null)[];
+  bbFade: (BollingerBandsResult | null)[];
+  wicks: CandleWickAnalysis[];
+  consecBull: number[];
+  consecBear: number[];
+  swingHigh: number[];
+  swingLow: number[];
+}
+
+export function precomputeProfileSeries(candles: Candle[], profile: IndicatorProfile): PrecomputedProfileSeries {
+  const n = candles.length;
+  const closes = candles.map((c) => c.close);
+  const minNeeded = Math.max(30, profile.emaSlow + 5, profile.bbPeriod + 5);
+
+  const emaFast: (number | undefined)[] = new Array(n).fill(undefined);
+  const emaSlow: (number | undefined)[] = new Array(n).fill(undefined);
+  const rsi: (number | undefined)[] = new Array(n).fill(undefined);
+  const stochK: (number | undefined)[] = new Array(n).fill(undefined);
+  const stochD: (number | undefined)[] = new Array(n).fill(undefined);
+  const bbMain: (BollingerBandsResult | null)[] = new Array(n).fill(null);
+  const bbFade: (BollingerBandsResult | null)[] = new Array(n).fill(null);
+  const wicks: CandleWickAnalysis[] = new Array(n);
+  const consecBull: number[] = new Array(n).fill(0);
+  const consecBear: number[] = new Array(n).fill(0);
+  const swingHigh: number[] = new Array(n).fill(0);
+  const swingLow: number[] = new Array(n).fill(0);
+
+  if (n >= profile.emaFast) {
+    const arr = TechnicalIndicators.calculateEMA(closes, profile.emaFast);
+    const offset = profile.emaFast - 1;
+    for (let j = 0; j < arr.length; j++) emaFast[offset + j] = arr[j];
+  }
+
+  if (n >= profile.emaSlow) {
+    const arr = TechnicalIndicators.calculateEMA(closes, profile.emaSlow);
+    const offset = profile.emaSlow - 1;
+    for (let j = 0; j < arr.length; j++) emaSlow[offset + j] = arr[j];
+  }
+
+  if (n > profile.rsiPeriod) {
+    const arr = TechnicalIndicators.calculateRSI(closes, profile.rsiPeriod);
+    const offset = profile.rsiPeriod;
+    for (let j = 0; j < arr.length; j++) rsi[offset + j] = arr[j];
+  }
+
+  if (n >= profile.stochK + 4) {
+    const stoch = TechnicalIndicators.calculateStochastic(candles, profile.stochK, 3, 3);
+    const kOffset = profile.stochK + 1;
+    for (let j = 0; j < stoch.k.length; j++) stochK[kOffset + j] = stoch.k[j];
+    const dOffset = profile.stochK + 3;
+    for (let j = 0; j < stoch.d.length; j++) stochD[dOffset + j] = stoch.d[j];
+  }
+
+  const fadeDev = Math.max(1.7, profile.bbDev - 0.2);
+  const bp = profile.bbPeriod;
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    wicks[i] = TechnicalIndicators.analyzeCandleWicks(c);
+
+    if (c.close > c.open) {
+      consecBull[i] = i > 0 ? consecBull[i - 1] + 1 : 1;
+      consecBear[i] = 0;
+    } else if (c.close < c.open) {
+      consecBear[i] = i > 0 ? consecBear[i - 1] + 1 : 1;
+      consecBull[i] = 0;
+    }
+
+    // Swing high/low over the 22 candles strictly preceding index i (exact parity with slice(-23, -1))
+    if (i > 0) {
+      const start = Math.max(0, i - 22);
+      let hi = -Infinity;
+      let lo = Infinity;
+      for (let j = start; j < i; j++) {
+        if (candles[j].high > hi) hi = candles[j].high;
+        if (candles[j].low < lo) lo = candles[j].low;
+      }
+      swingHigh[i] = hi;
+      swingLow[i] = lo;
+    }
+
+    if (i >= bp - 1) {
+      let sum = 0;
+      for (let j = i - bp + 1; j <= i; j++) sum += closes[j];
+      const mean = sum / bp;
+      let varSum = 0;
+      for (let j = i - bp + 1; j <= i; j++) {
+        const diff = closes[j] - mean;
+        varSum += diff * diff;
+      }
+      const stdDev = Math.sqrt(varSum / bp);
+      const upperMain = mean + profile.bbDev * stdDev;
+      const lowerMain = mean - profile.bbDev * stdDev;
+      bbMain[i] = {
+        upper: upperMain,
+        middle: mean,
+        lower: lowerMain,
+        bandwidth: mean > 0 ? (upperMain - lowerMain) / mean : 0,
+      };
+      const upperFade = mean + fadeDev * stdDev;
+      const lowerFade = mean - fadeDev * stdDev;
+      bbFade[i] = {
+        upper: upperFade,
+        middle: mean,
+        lower: lowerFade,
+        bandwidth: mean > 0 ? (upperFade - lowerFade) / mean : 0,
+      };
+    }
+  }
+
+  return {
+    candles,
+    profile,
+    minNeeded,
+    emaFast,
+    emaSlow,
+    rsi,
+    stochK,
+    stochD,
+    bbMain,
+    bbFade,
+    wicks,
+    consecBull,
+    consecBear,
+    swingHigh,
+    swingLow,
+  };
 }
 
 export class SignalEngine {
   /**
-   * Evaluates a specific Playbook using a specific pair-optimized Indicator Profile
-   * (FAST / STANDARD / SMOOTH). Used identically in both Out-of-Sample Walk-Forward
-   * Calibration AND live entry decisions so zero discrepancy exists between test and live.
+   * Evaluates a specific playbook at candle index `i` using O(N) precomputed series.
+   * Bit-for-bit identical to `evaluatePlaybook(playbook, candles.slice(0, i + 1), profile)`.
    */
-  public evaluatePlaybook(
+  public evaluatePlaybookAt(
     playbook: PlaybookName,
-    candles: Candle[],
-    profile: IndicatorProfile = INDICATOR_PROFILES.STANDARD
+    series: PrecomputedProfileSeries,
+    i: number
   ): PlaybookSignalResult | null {
-    const minNeeded = Math.max(30, profile.emaSlow + 5, profile.bbPeriod + 5);
-    if (candles.length < minNeeded || playbook === 'NONE') return null;
-
-    const closes = candles.map((c) => c.close);
-    const last = candles[candles.length - 1];
-    const prev = candles[candles.length - 2];
-    const emaFastArr = TechnicalIndicators.calculateEMA(closes, profile.emaFast);
-    const emaSlowArr = TechnicalIndicators.calculateEMA(closes, profile.emaSlow);
-    const rsiArr = TechnicalIndicators.calculateRSI(closes, profile.rsiPeriod);
-    const stoch = TechnicalIndicators.calculateStochastic(candles, profile.stochK, 3, 3);
-    const bbMain = TechnicalIndicators.calculateBollingerBands(closes, profile.bbPeriod, profile.bbDev);
-    const bbFade = TechnicalIndicators.calculateBollingerBands(closes, profile.bbPeriod, Math.max(1.7, profile.bbDev - 0.2));
-    const wick = TechnicalIndicators.analyzeCandleWicks(last);
-
-    if (emaFastArr.length < 3 || emaSlowArr.length < 2 || rsiArr.length < 2 || !bbMain || !bbFade) {
+    if (playbook === 'NONE' || i + 1 < series.minNeeded || i < 2 || i >= series.candles.length) {
       return null;
     }
 
-    const ef = emaFastArr[emaFastArr.length - 1];
-    const efPrev = emaFastArr[emaFastArr.length - 2];
-    const es = emaSlowArr[emaSlowArr.length - 1];
-    const rsi = rsiArr[rsiArr.length - 1];
-    const rsiPrev = rsiArr[rsiArr.length - 2];
-    const k = stoch.k.length > 0 ? stoch.k[stoch.k.length - 1] : 50;
-    const kPrev = stoch.k.length > 1 ? stoch.k[stoch.k.length - 2] : k;
-    const d = stoch.d.length > 0 ? stoch.d[stoch.d.length - 1] : 50;
+    const ef = series.emaFast[i];
+    const efPrev = series.emaFast[i - 1];
+    const es = series.emaSlow[i];
+    const rsi = series.rsi[i];
+    const rsiPrev = series.rsi[i - 1];
+    const bbMain = series.bbMain[i];
+    const bbFade = series.bbFade[i];
+
+    if (
+      ef === undefined ||
+      efPrev === undefined ||
+      es === undefined ||
+      rsi === undefined ||
+      rsiPrev === undefined ||
+      !bbMain ||
+      !bbFade
+    ) {
+      return null;
+    }
+
+    const profile = series.profile;
+    const last = series.candles[i];
+    const prev = series.candles[i - 1];
+    const wick = series.wicks[i];
+    const k = series.stochK[i] ?? 50;
+    const kPrev = series.stochK[i - 1] ?? k;
+    const d = series.stochD[i] ?? 50;
 
     const bbSpan = Math.max(1e-9, bbMain.upper - bbMain.lower);
     const pctB = (last.close - bbMain.lower) / bbSpan;
 
-    // Count consecutive same-color candles leading into this bar
-    let consecutiveBull = 0;
-    let consecutiveBear = 0;
-    for (let i = candles.length - 1; i >= 0; i--) {
-      if (candles[i].close > candles[i].open) {
-        if (consecutiveBear > 0) break;
-        consecutiveBull++;
-      } else if (candles[i].close < candles[i].open) {
-        if (consecutiveBull > 0) break;
-        consecutiveBear++;
-      } else {
-        break;
-      }
-    }
+    const consecutiveBull = series.consecBull[i];
+    const consecutiveBear = series.consecBear[i];
 
-    // Swing Support & Resistance over last 22 candles (never buy straight into resistance or sell into support)
-    const lookback = candles.slice(-23, -1);
-    const swingHigh = Math.max(...lookback.map((c) => c.high));
-    const swingLow = Math.min(...lookback.map((c) => c.low));
-    const swingSpan = Math.max(1e-9, swingHigh - swingLow);
-    const nearResistance = (swingHigh - last.close) / swingSpan < 0.08;
-    const nearSupport = (last.close - swingLow) / swingSpan < 0.08;
+    const swingSpan = Math.max(1e-9, series.swingHigh[i] - series.swingLow[i]);
+    const nearResistance = (series.swingHigh[i] - last.close) / swingSpan < 0.08;
+    const nearSupport = (last.close - series.swingLow[i]) / swingSpan < 0.08;
 
     const rsiHighCap = profile.rsiPeriod <= 8 ? 72 : 66;
     const rsiLowFloor = profile.rsiPeriod <= 8 ? 28 : 34;
 
-    // ── PLAYBOOK 1: EMA PULLBACK SNIPER ──
+    // ── PLAYBOOK 1: EMA PULLBACK ──
     if (playbook === 'EMA_PULLBACK_SNIPER') {
       if (
         ef > es &&
@@ -173,12 +363,11 @@ export class SignalEngine {
         return {
           direction: 'CALL',
           alignedPillars: pillars,
-          score: pillars === 5 ? 92 : 84,
           reasons: [
-            `EMA(${profile.emaFast}/${profile.emaSlow}) Pullback Sniper: Price dipped to EMA(${profile.emaFast}) (${ef.toFixed(5)}) & rejected UP`,
-            `Macro Trend: EMA(${profile.emaFast}) > EMA(${profile.emaSlow}) (${es.toFixed(5)}) with space below swing resistance`,
-            `RSI(${profile.rsiPeriod}) Momentum: Healthy bullish zone at ${rsi.toFixed(1)}`,
-            `Price Action: Bullish rejection close (lower wick ${Math.round(wick.lowerWickRatio * 100)}%)`,
+            `EMA(${profile.emaFast}/${profile.emaSlow}) Pullback: Price touched EMA(${profile.emaFast}) (${ef.toFixed(5)}) and closed above it`,
+            `Trend filter: EMA(${profile.emaFast}) > EMA(${profile.emaSlow}) (${es.toFixed(5)}), clear of swing high`,
+            `RSI(${profile.rsiPeriod}): ${rsi.toFixed(1)} (mid-bullish range)`,
+            `Candle structure: Bullish close, lower wick ${Math.round(wick.lowerWickRatio * 100)}%`,
           ],
         };
       }
@@ -198,12 +387,11 @@ export class SignalEngine {
         return {
           direction: 'PUT',
           alignedPillars: pillars,
-          score: pillars === 5 ? 92 : 84,
           reasons: [
-            `EMA(${profile.emaFast}/${profile.emaSlow}) Pullback Sniper: Price rallied to EMA(${profile.emaFast}) (${ef.toFixed(5)}) & rejected DOWN`,
-            `Macro Trend: EMA(${profile.emaFast}) < EMA(${profile.emaSlow}) (${es.toFixed(5)}) with space above swing support`,
-            `RSI(${profile.rsiPeriod}) Momentum: Healthy bearish zone at ${rsi.toFixed(1)}`,
-            `Price Action: Bearish rejection close (upper wick ${Math.round(wick.upperWickRatio * 100)}%)`,
+            `EMA(${profile.emaFast}/${profile.emaSlow}) Pullback: Price touched EMA(${profile.emaFast}) (${ef.toFixed(5)}) and closed below it`,
+            `Trend filter: EMA(${profile.emaFast}) < EMA(${profile.emaSlow}) (${es.toFixed(5)}), clear of swing low`,
+            `RSI(${profile.rsiPeriod}): ${rsi.toFixed(1)} (mid-bearish range)`,
+            `Candle structure: Bearish close, upper wick ${Math.round(wick.upperWickRatio * 100)}%`,
           ],
         };
       }
@@ -231,12 +419,11 @@ export class SignalEngine {
         return {
           direction: 'CALL',
           alignedPillars: pillars,
-          score: pillars === 5 ? 90 : 82,
           reasons: [
             `Momentum Channel [${profile.name}]: Rising EMA(${profile.emaFast}) > EMA(${profile.emaSlow})`,
-            `Bollinger(${profile.bbPeriod},${profile.bbDev}): Clean bullish channel (%B ${(pctB * 100).toFixed(0)}%)`,
-            `RSI(${profile.rsiPeriod}) Momentum: Rising ${rsiPrev.toFixed(1)} -> ${rsi.toFixed(1)}`,
-            `Price Action: Solid green continuation candle (body ${Math.round(wick.bodyRatio * 100)}%)`,
+            `Bollinger(${profile.bbPeriod},${profile.bbDev}): Mid-upper band (%B ${(pctB * 100).toFixed(0)}%)`,
+            `RSI(${profile.rsiPeriod}): Rising ${rsiPrev.toFixed(1)} -> ${rsi.toFixed(1)}`,
+            `Candle structure: Bullish body ${Math.round(wick.bodyRatio * 100)}%`,
           ],
         };
       }
@@ -260,12 +447,11 @@ export class SignalEngine {
         return {
           direction: 'PUT',
           alignedPillars: pillars,
-          score: pillars === 5 ? 90 : 82,
           reasons: [
             `Momentum Channel [${profile.name}]: Falling EMA(${profile.emaFast}) < EMA(${profile.emaSlow})`,
-            `Bollinger(${profile.bbPeriod},${profile.bbDev}): Clean bearish channel (%B ${(pctB * 100).toFixed(0)}%)`,
-            `RSI(${profile.rsiPeriod}) Momentum: Falling ${rsiPrev.toFixed(1)} -> ${rsi.toFixed(1)}`,
-            `Price Action: Solid red continuation candle (body ${Math.round(wick.bodyRatio * 100)}%)`,
+            `Bollinger(${profile.bbPeriod},${profile.bbDev}): Mid-lower band (%B ${(pctB * 100).toFixed(0)}%)`,
+            `RSI(${profile.rsiPeriod}): Falling ${rsiPrev.toFixed(1)} -> ${rsi.toFixed(1)}`,
+            `Candle structure: Bearish body ${Math.round(wick.bodyRatio * 100)}%`,
           ],
         };
       }
@@ -280,12 +466,11 @@ export class SignalEngine {
         return {
           direction: 'CALL',
           alignedPillars: 4,
-          score: 82,
           reasons: [
-            `Exhaustion Fade [${profile.name}]: ${consecutiveBear} consecutive red candles stretched into oversold floor`,
-            `Bollinger(${profile.bbPeriod}): Price stretched below Lower Band (${bbFade.lower.toFixed(5)})`,
-            `RSI(${profile.rsiPeriod}) Extreme: Deeply oversold at ${rsi.toFixed(1)} — snap-back expected`,
-            `Stochastic(${profile.stochK},3,3): %K at ${k.toFixed(0)} signaling short-term seller exhaustion`,
+            `Exhaustion Fade [${profile.name}]: ${consecutiveBear} consecutive red candles stretched into lower band`,
+            `Bollinger(${profile.bbPeriod}): Close ${last.close.toFixed(5)} vs Lower Band ${bbFade.lower.toFixed(5)}`,
+            `RSI(${profile.rsiPeriod}): Oversold at ${rsi.toFixed(1)}`,
+            `Stochastic(${profile.stochK},3,3): %K at ${k.toFixed(0)}`,
           ],
         };
       }
@@ -293,12 +478,11 @@ export class SignalEngine {
         return {
           direction: 'PUT',
           alignedPillars: 4,
-          score: 82,
           reasons: [
-            `Exhaustion Fade [${profile.name}]: ${consecutiveBull} consecutive green candles stretched into overbought ceiling`,
-            `Bollinger(${profile.bbPeriod}): Price stretched above Upper Band (${bbFade.upper.toFixed(5)})`,
-            `RSI(${profile.rsiPeriod}) Extreme: Deeply overbought at ${rsi.toFixed(1)} — pullback expected`,
-            `Stochastic(${profile.stochK},3,3): %K at ${k.toFixed(0)} signaling short-term buyer exhaustion`,
+            `Exhaustion Fade [${profile.name}]: ${consecutiveBull} consecutive green candles stretched into upper band`,
+            `Bollinger(${profile.bbPeriod}): Close ${last.close.toFixed(5)} vs Upper Band ${bbFade.upper.toFixed(5)}`,
+            `RSI(${profile.rsiPeriod}): Overbought at ${rsi.toFixed(1)}`,
+            `Stochastic(${profile.stochK},3,3): %K at ${k.toFixed(0)}`,
           ],
         };
       }
@@ -309,24 +493,50 @@ export class SignalEngine {
   }
 
   /**
-   * Strict Out-of-Sample Walk-Forward Self-Calibration Engine:
-   * Searches across:
-   *   - 3 Playbooks (EMA_PULLBACK_SNIPER, MOMENTUM_CHANNEL, STREAK_EXHAUSTION_FADE)
-   *   - 3 Indicator Parameter Profiles (FAST, STANDARD, SMOOTH)
-   *   - 2-3 Expiry Duration Horizons (1-candle vs 2-candle vs 3-candle hold — "how long price stays up/down")
-   * Splits the pair's ~200 real historical candles into Training (first 65%) and Unseen Validation (latest 35%)
-   * so we ONLY approve a pair & indicator profile that is STILL winning on recent unseen candles!
+   * Evaluates a specific Playbook on the latest bar of `candles`.
+   * Uses the exact same precomputed logic as calibration & backtesting so zero test/live drift exists.
+   */
+  public evaluatePlaybook(
+    playbook: PlaybookName,
+    candles: Candle[],
+    profile: IndicatorProfile = INDICATOR_PROFILES.STANDARD
+  ): PlaybookSignalResult | null {
+    const minNeeded = Math.max(30, profile.emaSlow + 5, profile.bbPeriod + 5);
+    if (candles.length < minNeeded || playbook === 'NONE') return null;
+    const series = precomputeProfileSeries(candles, profile);
+    return this.evaluatePlaybookAt(playbook, series, candles.length - 1);
+  }
+
+  /**
+   * Leak-Free Out-of-Sample Walk-Forward Calibration:
+   *
+   * 1. Splits `closedCandles` strictly into Training (first 60%) and Untouched Holdout OOS (final 40%).
+   *    No training trade is allowed to cross the split boundary into OOS.
+   * 2. Evaluates all (playbook x profile x horizon) variants on TRAINING ONLY and ranks them
+   *    strictly by Bonferroni-adjusted Train Wilson lower bound — OOS is NEVER peeked at during selection!
+   * 3. Takes ONLY the single #1 training winner and evaluates it ONCE on the untouched Holdout OOS split.
+   * 4. Gates on statistical Wilson lower bounds (not raw combined win rate) and assigns an honest tier:
+   *    - PROVEN_EDGE : >= 30 untouched OOS trades AND 95% OOS Wilson lower bound > break-even (p < 0.05)
+   *    - PRELIMINARY : >= minOosTrades untouched OOS trades AND 1-sigma OOS Wilson lower bound > break-even
+   *                    (exploratory/demo only — explicitly labeled UNPROVEN and rejected if strictProvenOnly=true)
+   *    - NO_EDGE     : fails statistical criteria
    */
   public calibratePairPlaybook(
     asset: string,
     closedCandles: Candle[],
     payoutPercent: number,
-    timeframeSeconds: number = 300
+    timeframeSeconds: number = 300,
+    options: CalibrationOptions = {}
   ): PairCalibrationReport {
+    const minPayout = options.minPayoutPercent ?? 80;
+    const strictProvenOnly = options.strictProvenOnly ?? false;
+    const trainFraction = options.trainFraction ?? 0.6;
+    const minTrainTrades = options.minTrainTrades ?? 5;
+    const minOosTrades = options.minOosTrades ?? 4;
     const beWinRate = breakevenWinRate(payoutPercent);
     const defaultProfile = INDICATOR_PROFILES.STANDARD;
 
-    // Measure erratic whipsaw/doji trap ratio over the last 12 closed candles
+    // Measure whipsaw/doji trap ratio over the last 12 closed candles
     const recent12 = closedCandles.slice(-12);
     let whipsawCount = 0;
     for (const c of recent12) {
@@ -337,39 +547,43 @@ export class SignalEngine {
     }
     const whipsawRatio = recent12.length > 0 ? whipsawCount / recent12.length : 0;
 
-    if (payoutPercent < 80) {
+    if (payoutPercent < minPayout) {
       return {
         asset,
         payoutPercent,
         timeframeSeconds,
         candlesTested: closedCandles.length,
+        tier: 'NO_EDGE',
         bestPlaybook: 'NONE',
         bestProfile: defaultProfile,
         recommendedHorizonCandles: 1,
         recommendedExpirySeconds: timeframeSeconds,
         bestStats: null,
+        candidatesTested: 0,
         whipsawRatio,
         isTradeable: false,
         shouldRemovePair: true,
-        removeReason: `Low payout (${payoutPercent}% < 80% min; needs ${beWinRate.toFixed(1)}% WR to break even)`,
+        removeReason: `Low payout (${payoutPercent}% < ${minPayout}% min; needs ${beWinRate.toFixed(1)}% WR to break even)`,
       };
     }
 
-    if (closedCandles.length < 55) {
+    if (closedCandles.length < 70) {
       return {
         asset,
         payoutPercent,
         timeframeSeconds,
         candlesTested: closedCandles.length,
-        bestPlaybook: 'EMA_PULLBACK_SNIPER',
+        tier: 'NO_EDGE',
+        bestPlaybook: 'NONE',
         bestProfile: defaultProfile,
         recommendedHorizonCandles: 1,
         recommendedExpirySeconds: timeframeSeconds,
         bestStats: null,
+        candidatesTested: 0,
         whipsawRatio,
         isTradeable: false,
         shouldRemovePair: false,
-        removeReason: `Warming up history (${closedCandles.length}/55 closed candles)`,
+        removeReason: `Warming up history (${closedCandles.length}/70 closed candles)`,
       };
     }
 
@@ -379,149 +593,241 @@ export class SignalEngine {
         payoutPercent,
         timeframeSeconds,
         candlesTested: closedCandles.length,
+        tier: 'NO_EDGE',
         bestPlaybook: 'NONE',
         bestProfile: defaultProfile,
         recommendedHorizonCandles: 1,
         recommendedExpirySeconds: timeframeSeconds,
         bestStats: null,
+        candidatesTested: 0,
         whipsawRatio,
         isTradeable: false,
         shouldRemovePair: true,
-        removeReason: `Erratic whipsaw/doji traps (${Math.round(whipsawRatio * 100)}% trap candles in last 12 bars)`,
+        removeReason: `Erratic whipsaw/doji traps (${Math.round(whipsawRatio * 100)}% in last 12 bars)`,
       };
     }
 
-    const playbooks: PlaybookName[] = ['EMA_PULLBACK_SNIPER', 'MOMENTUM_CHANNEL', 'STREAK_EXHAUSTION_FADE'];
-    const profiles: IndicatorProfile[] = [
-      INDICATOR_PROFILES.FAST,
-      INDICATOR_PROFILES.STANDARD,
-      INDICATOR_PROFILES.SMOOTH,
-    ];
-    // Allowed duration horizons that match Quotex's real expiry presets (e.g. on 1m -> 1m/2m/3m; on 5m -> 5m/10m/15m)
-    const horizons = timeframeSeconds <= 60 ? [1, 2, 3] : timeframeSeconds === 300 ? [1, 2, 3] : [1, 2];
+    // Allowed expiry horizons matching Quotex's real expiry presets
+    const horizons = timeframeSeconds <= 60 || timeframeSeconds === 300 ? [1, 2, 3] : [1, 2];
+    const splitIdx = Math.max(45, Math.floor(closedCandles.length * trainFraction));
 
-    const splitIdx = Math.max(40, Math.floor(closedCandles.length * 0.65));
-    const candidates: PlaybookStats[] = [];
+    interface TrainCandidate {
+      playbook: PlaybookName;
+      profile: IndicatorProfile;
+      horizonCandles: number;
+      signalIndices: Array<{ idx: number; dir: 'CALL' | 'PUT' }>;
+      trainWins: number;
+      trainLosses: number;
+      trainWinRate: number;
+      trainWilsonLowBonf: number;
+      trainWilsonLow80: number;
+      trainPValue: number;
+    }
 
-    for (const pb of playbooks) {
-      for (const prof of profiles) {
-        // Compute signals once per (playbook, profile) across all historical bars, then grade across each duration horizon!
+    const totalPossibleVariants = ALL_PLAYBOOKS.length * ALL_PROFILES.length * horizons.length;
+    const bonfZ = bonferroniZ(totalPossibleVariants, 0.05, false);
+
+    let candidatesTested = 0;
+    const trainCandidates: TrainCandidate[] = [];
+
+    for (const prof of ALL_PROFILES) {
+      const series = precomputeProfileSeries(closedCandles, prof);
+      for (const pb of ALL_PLAYBOOKS) {
         const signalIndices: Array<{ idx: number; dir: 'CALL' | 'PUT' }> = [];
-        for (let i = 32; i < closedCandles.length - 1; i++) {
-          const sig = this.evaluatePlaybook(pb, closedCandles.slice(0, i + 1), prof);
+        for (let i = series.minNeeded - 1; i < closedCandles.length - 1; i++) {
+          const sig = this.evaluatePlaybookAt(pb, series, i);
           if (sig) {
             signalIndices.push({ idx: i, dir: sig.direction });
           }
         }
-        if (signalIndices.length < 6) continue;
 
         for (const h of horizons) {
+          candidatesTested++;
           let trainWins = 0;
           let trainLosses = 0;
-          let oosWins = 0;
-          let oosLosses = 0;
 
+          // STRICT TRAIN ONLY: exitIdx MUST stay strictly below splitIdx (zero boundary leakage into OOS)
           for (const s of signalIndices) {
             const entryIdx = s.idx + 1;
             const exitIdx = s.idx + h;
-            if (exitIdx >= closedCandles.length) continue;
+            if (exitIdx >= splitIdx) continue;
             const entryPrice = closedCandles[entryIdx].open;
             const exitPrice = closedCandles[exitIdx].close;
             if (exitPrice === entryPrice) continue;
 
             const won = (s.dir === 'CALL' && exitPrice > entryPrice) || (s.dir === 'PUT' && exitPrice < entryPrice);
-            if (s.idx < splitIdx) {
-              if (won) trainWins++;
-              else trainLosses++;
-            } else {
-              if (won) oosWins++;
-              else oosLosses++;
-            }
+            if (won) trainWins++;
+            else trainLosses++;
           }
 
           const trainTotal = trainWins + trainLosses;
-          const oosTotal = oosWins + oosLosses;
-          const total = trainTotal + oosTotal;
-          // Require both in-sample and out-of-sample triggers so we never fake OOS stats
-          if (total < 6 || trainTotal < 4 || oosTotal < 2) continue;
+          if (trainTotal < minTrainTrades) continue;
 
           const trainWinRate = (trainWins / trainTotal) * 100;
-          const oosWinRate = (oosWins / oosTotal) * 100;
-          const winRate = ((trainWins + oosWins) / total) * 100;
-          // Use 80% Wilson lower bound (z=1.28) to shrink noisy small-sample flukes
-          const wilsonLowerBound = wilsonInterval(trainWins + oosWins, total, 1.28).low;
-          const edgeAboveBreakeven = winRate - beWinRate;
+          if (trainWinRate <= beWinRate) continue;
 
-          candidates.push({
+          const trainWilsonLowBonf = wilsonInterval(trainWins, trainTotal, bonfZ).low;
+          const trainWilsonLow80 = wilsonInterval(trainWins, trainTotal, 1.28).low;
+          const trainPValue = binomialOneSidedPValue(trainWins, trainTotal, beWinRate / 100);
+
+          trainCandidates.push({
             playbook: pb,
             profile: prof,
             horizonCandles: h,
+            signalIndices,
             trainWins,
             trainLosses,
             trainWinRate,
-            oosWins,
-            oosLosses,
-            oosWinRate,
-            totalWins: trainWins + oosWins,
-            totalLosses: trainLosses + oosLosses,
-            winRate,
-            wilsonLowerBound,
-            edgeAboveBreakeven,
+            trainWilsonLowBonf,
+            trainWilsonLow80,
+            trainPValue,
           });
         }
       }
     }
 
-    // Score candidates using shrinkage-adjusted Wilson lower bound + unseen OOS consistency
-    candidates.sort((a, b) => {
-      const oosLowA = wilsonInterval(a.oosWins, a.oosWins + a.oosLosses, 1.0).low;
-      const oosLowB = wilsonInterval(b.oosWins, b.oosWins + b.oosLosses, 1.0).low;
-      const scoreA = a.wilsonLowerBound * 0.5 + oosLowA * 0.35 + a.winRate * 0.15;
-      const scoreB = b.wilsonLowerBound * 0.5 + oosLowB * 0.35 + b.winRate * 0.15;
-      return scoreB - scoreA;
+    // Rank STRICTLY on Training performance (NEVER touches OOS!)
+    trainCandidates.sort((a, b) => {
+      if (Math.abs(b.trainWilsonLowBonf - a.trainWilsonLowBonf) > 0.05) {
+        return b.trainWilsonLowBonf - a.trainWilsonLowBonf;
+      }
+      if (Math.abs(b.trainWilsonLow80 - a.trainWilsonLow80) > 0.05) {
+        return b.trainWilsonLow80 - a.trainWilsonLow80;
+      }
+      return b.trainWinRate - a.trainWinRate;
     });
 
-    const best = candidates[0] ?? null;
+    const selected = trainCandidates[0] ?? null;
 
-    // Require genuine OOS sample (>= 2 OOS trades), OOS WR >= max(55%, breakeven), train WR > breakeven, and overall WR >= 58% (+4.5% over BE)
-    const oosPassed =
-      best !== null &&
-      best.oosWins + best.oosLosses >= 2 &&
-      best.oosWinRate >= Math.max(55, beWinRate) &&
-      best.trainWinRate >= beWinRate;
-    const isTradeable =
-      best !== null && best.winRate >= 58 && best.edgeAboveBreakeven >= 4.5 && oosPassed;
+    if (!selected) {
+      return {
+        asset,
+        payoutPercent,
+        timeframeSeconds,
+        candlesTested: closedCandles.length,
+        tier: 'NO_EDGE',
+        bestPlaybook: 'NONE',
+        bestProfile: defaultProfile,
+        recommendedHorizonCandles: 1,
+        recommendedExpirySeconds: timeframeSeconds,
+        bestStats: null,
+        candidatesTested,
+        whipsawRatio,
+        isTradeable: false,
+        shouldRemovePair: true,
+        removeReason: `No playbook beat ${beWinRate.toFixed(1)}% break-even in training across ${closedCandles.length} candles`,
+      };
+    }
 
-    const bestHorizon = isTradeable && best ? best.horizonCandles : 1;
-    const bestProfile = isTradeable && best ? best.profile : defaultProfile;
+    // ── STEP 2: EVALUATE ONLY THE SINGLE TRAIN WINNER ON UNTOUCHED HOLDOUT OOS ──
+    let oosWins = 0;
+    let oosLosses = 0;
+    for (const s of selected.signalIndices) {
+      if (s.idx < splitIdx) continue;
+      const entryIdx = s.idx + 1;
+      const exitIdx = s.idx + selected.horizonCandles;
+      if (exitIdx >= closedCandles.length) continue;
+      const entryPrice = closedCandles[entryIdx].open;
+      const exitPrice = closedCandles[exitIdx].close;
+      if (exitPrice === entryPrice) continue;
+
+      const won = (s.dir === 'CALL' && exitPrice > entryPrice) || (s.dir === 'PUT' && exitPrice < entryPrice);
+      if (won) oosWins++;
+      else oosLosses++;
+    }
+
+    const oosTotal = oosWins + oosLosses;
+    const oosWinRate = oosTotal > 0 ? (oosWins / oosTotal) * 100 : 0;
+    const oos95 = wilsonInterval(oosWins, oosTotal, 1.96);
+    const oos1Sigma = wilsonInterval(oosWins, oosTotal, 1.0);
+    const oosPValue = binomialOneSidedPValue(oosWins, oosTotal, beWinRate / 100);
+    const trainPValueBonf = Math.min(1, selected.trainPValue * Math.max(1, candidatesTested));
+
+    // Honest shrunk win probability based purely on untouched OOS (pulled toward 50% prior)
+    const estimatedWinRate = empiricalBayesWinRate(oosWins, oosTotal, 50, 20);
+    const evPerDollar = expectedValuePerDollar(estimatedWinRate, payoutPercent);
+    const rawOosEv = oosTotal > 0 ? expectedValuePerDollar(oosWinRate, payoutPercent) : -1;
+    const hk = halfKellyFraction(estimatedWinRate, payoutPercent);
+
+    const totalWins = selected.trainWins + oosWins;
+    const totalLosses = selected.trainLosses + oosLosses;
+    const combinedWinRate = totalWins + totalLosses > 0 ? (totalWins / (totalWins + totalLosses)) * 100 : 0;
+
+    const bestStats: PlaybookStats = {
+      playbook: selected.playbook,
+      profile: selected.profile,
+      horizonCandles: selected.horizonCandles,
+      trainWins: selected.trainWins,
+      trainLosses: selected.trainLosses,
+      trainWinRate: selected.trainWinRate,
+      trainWilsonLowBonf: selected.trainWilsonLowBonf,
+      trainPValueBonf,
+      oosWins,
+      oosLosses,
+      oosWinRate,
+      oosWilsonLow95: oos95.low,
+      oosWilsonHigh95: oos95.high,
+      oosWilsonLow1Sigma: oos1Sigma.low,
+      oosPValue,
+      estimatedWinRate,
+      expectedValuePerDollar: evPerDollar,
+      rawOosEvPerDollar: rawOosEv,
+      halfKelly: hk,
+      candidatesTested,
+      totalWins,
+      totalLosses,
+      winRate: combinedWinRate,
+      wilsonLowerBound: oos95.low,
+      edgeAboveBreakeven: oosWinRate - beWinRate,
+    };
+
+    // Determine honest statistical tier strictly from UNTOUCHED OOS
+    let tier: CalibrationTier = 'NO_EDGE';
+    if (oosTotal >= 30 && oos95.low > beWinRate && oosPValue < 0.05) {
+      tier = 'PROVEN_EDGE';
+    } else if (oosTotal >= minOosTrades && oos1Sigma.low > beWinRate && rawOosEv > 0.02) {
+      tier = 'PRELIMINARY';
+    }
+
+    const isTradeable = strictProvenOnly ? tier === 'PROVEN_EDGE' : tier === 'PROVEN_EDGE' || tier === 'PRELIMINARY';
+    const bestHorizon = isTradeable ? selected.horizonCandles : 1;
+    const bestProfile = isTradeable ? selected.profile : defaultProfile;
+    const pbLabel = PLAYBOOK_DISPLAY_NAMES[selected.playbook];
+
+    let removeReason: string | undefined;
+    if (!isTradeable) {
+      if (oosTotal < minOosTrades) {
+        removeReason = `Too few untouched OOS signals on ${asset} (${oosTotal}/${minOosTrades} for ${pbLabel}/${selected.profile.name}; train was ${selected.trainWins}W-${selected.trainLosses}L)`;
+      } else if (strictProvenOnly && tier === 'PRELIMINARY') {
+        removeReason = `${asset} only reached PRELIMINARY tier (${oosWins}/${oosTotal} OOS, 95% CI ${oos95.low.toFixed(1)}-${oos95.high.toFixed(1)}% overlaps ${beWinRate.toFixed(1)}% BE) — LIVE requires PROVEN_EDGE`;
+      } else {
+        removeReason = `Failed untouched OOS on ${asset} (${pbLabel}/${selected.profile.name} ${selected.horizonCandles}c: ${oosWins}W-${oosLosses}L = ${oosWinRate.toFixed(1)}%, 1-sigma low ${oos1Sigma.low.toFixed(1)}% <= ${beWinRate.toFixed(1)}% BE)`;
+      }
+    }
 
     return {
       asset,
       payoutPercent,
       timeframeSeconds,
       candlesTested: closedCandles.length,
-      bestPlaybook: isTradeable && best ? best.playbook : 'NONE',
+      tier,
+      bestPlaybook: isTradeable ? selected.playbook : 'NONE',
       bestProfile,
       recommendedHorizonCandles: bestHorizon,
       recommendedExpirySeconds: timeframeSeconds * bestHorizon,
-      bestStats: best,
+      bestStats,
+      candidatesTested,
       whipsawRatio,
       isTradeable,
       shouldRemovePair: !isTradeable,
-      removeReason: !isTradeable
-        ? best
-          ? `Unreliable regime on ${asset} (best ${best.playbook}/${best.profile.name} ${best.horizonCandles}c: ${best.winRate.toFixed(
-              1
-            )}% total, ${best.oosWinRate.toFixed(0)}% recent unseen — need >= 58% total & >= 55% recent)`
-          : `Insufficient clean setups on ${asset} (${closedCandles.length} candles analyzed)`
-        : undefined,
+      removeReason,
     };
   }
 
   /**
-   * Pro-Trader Self-Calibrating Intelligence Engine:
-   * Uses the pair's Out-of-Sample Walk-Forward calibrated (Playbook + Indicator Profile + Expiry Duration)
-   * and enforces volatility & live-journal toxic-pair guardrails.
+   * Adaptive Pair Intelligence Engine:
+   * Uses the pair's leak-free Walk-Forward calibrated (Playbook + Profile + Horizon),
+   * enforces volatility and journal circuit breakers, and reports honest shrunk win probability & EV.
    */
   public analyzeAdaptivePairIntelligence(
     asset: string,
@@ -532,7 +838,11 @@ export class SignalEngine {
     journalTrades?: TradeRecord[],
     livePriceOverride?: number,
     timeframeSeconds: number = 300,
-    cachedCalibration?: PairCalibrationReport | null
+    cachedCalibration?: PairCalibrationReport | null,
+    options?: {
+      strictProvenOnly?: boolean;
+      pairLossStreakLimit?: number;
+    }
   ): AdaptivePairIntelligence {
     const closedOnly = candles.filter((c) => c.isClosed !== false);
     const evalCandles = closedOnly.length >= 10 ? closedOnly : candles;
@@ -540,6 +850,7 @@ export class SignalEngine {
     const lastCandle = evalCandles[evalCandles.length - 1];
     const livePrice = livePriceOverride ?? lastCandle?.close ?? 1;
     const beWinRate = breakevenWinRate(payoutPercent);
+    const pairLossLimit = options?.pairLossStreakLimit ?? 3;
 
     // 1. Kaufman Efficiency Ratio (ER) over last 10 closed candles
     const erLookback = Math.min(10, Math.max(2, closes.length - 1));
@@ -567,11 +878,15 @@ export class SignalEngine {
         ? 'ERRATIC_SPIKE'
         : 'HEALTHY';
 
-    // 3. Reuse fresh calibration report if provided, otherwise run Out-of-Sample Walk-Forward Calibration
+    // 3. Reuse fresh calibration report if provided, otherwise run leak-free Walk-Forward Calibration
     const calibration =
-      cachedCalibration && cachedCalibration.payoutPercent === payoutPercent && cachedCalibration.timeframeSeconds === timeframeSeconds
+      cachedCalibration &&
+      cachedCalibration.payoutPercent === payoutPercent &&
+      cachedCalibration.timeframeSeconds === timeframeSeconds
         ? cachedCalibration
-        : this.calibratePairPlaybook(asset, evalCandles, payoutPercent, timeframeSeconds);
+        : this.calibratePairPlaybook(asset, evalCandles, payoutPercent, timeframeSeconds, {
+            strictProvenOnly: options?.strictProvenOnly,
+          });
 
     // Compute live IndicatorSnapshot and MarketRegime using the pair's calibrated profile
     const activeProfile = calibration.bestProfile;
@@ -607,21 +922,21 @@ export class SignalEngine {
         const wins = pairTrades.filter((t) => t.status === 'WON').length;
         const wr = (wins / pairTrades.length) * 100;
         journalEdgeSummary = `Journal on ${asset}: ${wins}/${pairTrades.length} won (${wr.toFixed(1)}% vs ${beWinRate.toFixed(1)}% BE)`;
-        const last2 = pairTrades.slice(-2);
+        const recentSlice = pairTrades.slice(-pairLossLimit);
         const nowMs = Date.now();
         if (
-          last2.length === 2 &&
-          last2.every((t) => t.status === 'LOST' && nowMs - toMs(t.openTime) < 45 * 60 * 1000)
+          recentSlice.length === pairLossLimit &&
+          recentSlice.every((t) => t.status === 'LOST' && nowMs - toMs(t.openTime) < 45 * 60 * 1000)
         ) {
           journalToxic = true;
         }
       }
     }
 
-    let shouldSwitchPair = calibration.shouldRemovePair || volatilityState !== 'HEALTHY' || journalToxic;
+    const shouldSwitchPair = calibration.shouldRemovePair || volatilityState !== 'HEALTHY' || journalToxic;
     let switchReason = calibration.removeReason;
     if (journalToxic) {
-      switchReason = `${asset} suffered 2 consecutive live losses recently — remove & replace`;
+      switchReason = `${asset} hit ${pairLossLimit} consecutive live losses recently — cooling down`;
     } else if (volatilityState === 'DEAD_SQUEEZE') {
       switchReason = `${asset} candles are flat/dead squeeze`;
     } else if (volatilityState === 'ERRATIC_SPIKE') {
@@ -635,58 +950,58 @@ export class SignalEngine {
         ? 'MEAN_REVERSION_BB'
         : 'TREND_PULLBACK';
 
+    const pbLabel = PLAYBOOK_DISPLAY_NAMES[calibration.bestPlaybook];
     let directionCall: 'CALL' | 'PUT' | 'WAIT' = 'WAIT';
     let alignedPillars = 0;
-    let convictionScore = 0;
+    let estimatedWinProb = calibration.bestStats?.estimatedWinRate ?? 50;
+    let evPerDollar = calibration.bestStats?.expectedValuePerDollar ?? expectedValuePerDollar(50, payoutPercent);
     let factors: string[] = [];
     let callLabel = '';
 
     if (calibration.isTradeable && volatilityState === 'HEALTHY' && !journalToxic) {
       const pbResult = this.evaluatePlaybook(calibration.bestPlaybook, evalCandles, calibration.bestProfile);
+      const pbStats = calibration.bestStats!;
+      const tierBadge = calibration.tier === 'PROVEN_EDGE' ? 'PROVEN' : 'PRELIMINARY [UNPROVEN]';
+      const oosTotal = pbStats.oosWins + pbStats.oosLosses;
+
       if (pbResult) {
-        let bonus = 0;
-        const pbStats = calibration.bestStats!;
         const reasons = [
-          `Out-of-Sample Calibrated [${calibration.bestPlaybook} | ${calibration.bestProfile.name} | ${
-            calibration.recommendedHorizonCandles
-          }c Hold]: ${pbStats.winRate.toFixed(1)}% total (${pbStats.totalWins}W-${pbStats.totalLosses}L) & ${pbStats.oosWinRate.toFixed(
-            0
-          )}% recent unseen WR`,
+          `Untouched OOS [${pbLabel} | ${calibration.bestProfile.name} | ${calibration.recommendedHorizonCandles}c]: ${pbStats.oosWins}/${oosTotal} (${pbStats.oosWinRate.toFixed(1)}%, 95% CI ${pbStats.oosWilsonLow95.toFixed(1)}-${pbStats.oosWilsonHigh95.toFixed(1)}%) | Tier: ${tierBadge}`,
+          `Shrunk Est Win Prob: ${pbStats.estimatedWinRate.toFixed(1)}% vs ${beWinRate.toFixed(1)}% BE | Shrunk EV: ${evPerDollar >= 0 ? '+' : ''}$${evPerDollar.toFixed(3)}/$1 | Raw OOS EV: ${pbStats.rawOosEvPerDollar >= 0 ? '+' : ''}$${pbStats.rawOosEvPerDollar.toFixed(3)}/$1`,
           ...pbResult.reasons,
         ];
 
-        // Check micro-structure OHLC candlestick pattern (Pinbar / Engulfing) on true price data
         const prevCandle = evalCandles.length >= 2 ? evalCandles[evalCandles.length - 2] : undefined;
         const pattern = lastCandle ? TechnicalIndicators.detectPattern(lastCandle, prevCandle) : 'NONE';
+        let structureBonus = 0;
         if (
           (pbResult.direction === 'CALL' && (pattern === 'PINBAR_BULLISH' || pattern === 'ENGULFING_BULLISH')) ||
           (pbResult.direction === 'PUT' && (pattern === 'PINBAR_BEARISH' || pattern === 'ENGULFING_BEARISH'))
         ) {
-          bonus = 4;
-          reasons.push(`OHLC Price Action: Confirmed ${pattern.replace('_', ' ')} candle structure`);
+          structureBonus = 1;
+          reasons.push(`OHLC Pattern: ${pattern.replace('_', ' ')}`);
         } else if (visual?.canvasFound && visual.visualBias === pbResult.direction) {
-          bonus = 4;
-          reasons.push(`Chart Structure: Confirms ${pbResult.direction} directional bias`);
+          structureBonus = 1;
+          reasons.push(`OHLC Structure: Aligns with ${pbResult.direction} slope`);
+        }
+        if (isOtc) {
+          reasons.push('Notice: OTC feed is broker-generated (counterparty risk)');
         }
 
         directionCall = pbResult.direction;
-        alignedPillars = Math.min(5, pbResult.alignedPillars + (bonus > 0 ? 1 : 0));
-        convictionScore = Math.min(96, pbResult.score + bonus);
+        alignedPillars = Math.min(5, pbResult.alignedPillars + structureBonus);
+        estimatedWinProb = pbStats.estimatedWinRate;
+        evPerDollar = pbStats.expectedValuePerDollar;
         factors = reasons;
-        callLabel = `${pbResult.direction} [${pbResult.direction === 'CALL' ? 'UP' : 'DOWN'}] (${
-          calibration.bestPlaybook
-        }/${calibration.bestProfile.name} · ${pbStats.oosWinRate.toFixed(0)}% OOS)`;
+        callLabel = `${pbResult.direction} (${pbLabel}/${calibration.bestProfile.name} · OOS ${pbStats.oosWins}/${oosTotal} ${pbStats.oosWinRate.toFixed(0)}% · Est ${estimatedWinProb.toFixed(1)}% · ${tierBadge})`;
       } else {
-        const pbStats = calibration.bestStats!;
-        callLabel = `WAIT (${calibration.bestPlaybook}/${calibration.bestProfile.name} · ${pbStats.winRate.toFixed(
-          0
-        )}% WR / ${pbStats.oosWinRate.toFixed(0)}% OOS)`;
+        callLabel = `WAIT (${pbLabel}/${calibration.bestProfile.name} · OOS ${pbStats.oosWins}/${oosTotal} ${pbStats.oosWinRate.toFixed(0)}% · ${tierBadge})`;
         factors = [
-          `Calibrated: ${calibration.bestPlaybook} (${calibration.bestProfile.name}, ${calibration.recommendedHorizonCandles}c expiry) — waiting for exact trigger`,
+          `Calibrated [${tierBadge}]: ${pbLabel} (${calibration.bestProfile.name}, ${calibration.recommendedHorizonCandles}c) — waiting for trigger`,
         ];
       }
     } else {
-      callLabel = `SKIP / REMOVE (${switchReason || 'No calibrated edge'})`;
+      callLabel = `NO EDGE (${switchReason || 'Failed untouched OOS'})`;
       factors = [switchReason || 'No calibrated edge on this market'];
     }
 
@@ -695,9 +1010,11 @@ export class SignalEngine {
       isOtc,
       strategyMode,
       activePlaybook: calibration.bestPlaybook,
+      playbookLabel: pbLabel,
       activeProfile: calibration.bestProfile,
       recommendedExpirySeconds: calibration.recommendedExpirySeconds,
       calibration,
+      calibrationTier: calibration.tier,
       marketRegime,
       indicatorsAtEntry,
       efficiencyRatio,
@@ -705,7 +1022,9 @@ export class SignalEngine {
       volatilityState,
       directionCall,
       callLabel,
-      convictionScore,
+      estimatedWinProb,
+      expectedValuePerDollar: evPerDollar,
+      convictionScore: Math.round(estimatedWinProb * 10) / 10,
       alignedPillars,
       totalPillars: 5,
       shouldSwitchPair,

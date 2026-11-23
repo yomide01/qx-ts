@@ -5,24 +5,44 @@ import { TradeDeal } from '../stream/types.js';
 import { TradeRecord, IndicatorSnapshot } from './types.js';
 import { isOtcAsset, normalizeAsset } from '../stream/assets.js';
 
+export type MarketRegimeValue = 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY';
+
 export interface PendingSignalContext {
   confidence: number;
   reason: string;
-  regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY';
+  regime: MarketRegimeValue;
   indicators: IndicatorSnapshot;
   createdAt: number;
 }
 
+export type LiveContextProvider = (
+  asset: string,
+  timeframeSeconds: number
+) => { regime: MarketRegimeValue; indicators: IndicatorSnapshot } | null;
+
 export class TradeWatcher extends EventEmitter {
   private warnedUnknownMode = false;
   private pendingContextByAsset = new Map<string, PendingSignalContext>();
+  private liveContextProvider: LiveContextProvider | null = null;
 
   constructor(
     private sniffer: QxWsSniffer,
-    private db: TradingJournalDB
+    private db: TradingJournalDB,
+    liveContextProvider?: LiveContextProvider
   ) {
     super();
+    if (liveContextProvider) {
+      this.liveContextProvider = liveContextProvider;
+    }
     this.sniffer.on('deal', (deal: TradeDeal) => this.onDeal(deal));
+  }
+
+  /**
+   * Wires a live candle/indicator context provider so even manual trades taken
+   * without a bot signal still record accurate marketRegime and indicatorsAtEntry.
+   */
+  public setLiveContextProvider(provider: LiveContextProvider): void {
+    this.liveContextProvider = provider;
   }
 
   /**
@@ -33,7 +53,7 @@ export class TradeWatcher extends EventEmitter {
     asset: string,
     confidence: number,
     reason: string,
-    regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY',
+    regime: MarketRegimeValue,
     indicators: IndicatorSnapshot
   ): void {
     this.pendingContextByAsset.set(normalizeAsset(asset), {
@@ -49,12 +69,11 @@ export class TradeWatcher extends EventEmitter {
     const normAsset = normalizeAsset(deal.asset);
     const existing = this.db.getTrade(deal.id);
     const assetPayout = this.sniffer.getPayout(normAsset);
-    const rawPayout = assetPayout?.payoutPercent ?? 80;
+    // Prefer Quotex's exact per-deal percentProfit when present, then sniffer payout
+    const rawPayout = deal.payoutPercent ?? assetPayout?.payoutPercent ?? 80;
     const payoutPercent = TradingJournalDB.sanitizePayoutPercent(rawPayout, deal.amount);
     const isOtc = assetPayout?.isOtc ?? isOtcAsset(normAsset);
 
-    // Which account was this trade on? Prefer what Quotex says about the deal itself, then the
-    // account the bot currently sees open. Never silently assume demo.
     const mode = this.sniffer.getAccountMode();
     let isDemo: boolean;
     if (deal.isDemo !== undefined) {
@@ -69,17 +88,28 @@ export class TradeWatcher extends EventEmitter {
       }
     }
 
+    const timeframeSeconds = TradingJournalDB.computeTimeframeSeconds(
+      deal.openTime,
+      deal.closeTime,
+      this.sniffer.getActiveTimeframe() || 300
+    );
+
     if (!existing) {
       const pending = this.pendingContextByAsset.get(normAsset);
-      const freshContext = pending && Date.now() - pending.createdAt < 90_000 ? pending : undefined;
+      const freshContext = pending && Date.now() - pending.createdAt < 120_000 ? pending : undefined;
 
-      // New trade opening
+      // Fallback: compute live regime & indicators directly from CandleAggregator if no pending signal
+      const fallbackContext =
+        !freshContext && this.liveContextProvider
+          ? this.liveContextProvider(normAsset, this.sniffer.getActiveTimeframe() || timeframeSeconds)
+          : null;
+
       const newRecord: TradeRecord = {
         id: deal.id,
         asset: normAsset,
         isOtc,
         direction: deal.direction.toUpperCase() as 'CALL' | 'PUT',
-        timeframeSeconds: TradingJournalDB.computeTimeframeSeconds(deal.openTime, deal.closeTime, 300),
+        timeframeSeconds,
         payoutPercent,
         stakeAmount: deal.amount,
         openTime: deal.openTime,
@@ -88,17 +118,19 @@ export class TradeWatcher extends EventEmitter {
         status: 'OPEN',
         isDemo,
         signalConfidence: freshContext?.confidence,
-        signalReason: freshContext?.reason,
-        marketRegime: freshContext?.regime,
-        indicatorsAtEntry: freshContext?.indicators,
+        signalReason: freshContext?.reason ?? (fallbackContext ? 'Manual / External Entry' : undefined),
+        marketRegime: freshContext?.regime ?? fallbackContext?.regime,
+        indicatorsAtEntry: freshContext?.indicators ?? fallbackContext?.indicators,
       };
 
       this.db.recordTrade(newRecord);
-      console.log(`\n[TradeWatcher] Recorded NEW trade: ${newRecord.direction} on ${newRecord.asset} ($${newRecord.stakeAmount})`);
+      const regimeTag = newRecord.marketRegime ? ` [${newRecord.marketRegime}]` : '';
+      console.log(
+        `\n[TradeWatcher] Recorded NEW trade: ${newRecord.direction} on ${newRecord.asset} ($${newRecord.stakeAmount}, ${payoutPercent}%)${regimeTag}`
+      );
       this.emit('tradeOpened', newRecord);
     }
 
-    // Check if the deal has genuinely completed/settled (and hasn't already been settled)
     if (deal.status !== 'open' && (!existing || existing.status === 'OPEN')) {
       const statusMap = {
         won: 'WON' as const,
@@ -117,7 +149,9 @@ export class TradeWatcher extends EventEmitter {
       }
 
       this.db.updateTradeOutcome(deal.id, deal.closePrice ?? deal.openPrice, profitLoss, finalStatus);
-      console.log(`\n[TradeWatcher] Trade SETTLED: ID ${deal.id} -> ${finalStatus} (PnL: ${profitLoss >= 0 ? '+' : ''}$${profitLoss.toFixed(2)})`);
+      console.log(
+        `\n[TradeWatcher] Trade SETTLED: ID ${deal.id} -> ${finalStatus} (PnL: ${profitLoss >= 0 ? '+' : ''}$${profitLoss.toFixed(2)})`
+      );
 
       const updated = this.db.getTrade(deal.id);
       if (updated) {
@@ -126,14 +160,11 @@ export class TradeWatcher extends EventEmitter {
     }
   }
 
-  /**
-   * Allows attaching signal engine metadata to a pending or just-opened trade
-   */
   public attachSignalContext(
     dealId: string,
     confidence: number,
     reason: string,
-    regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING' | 'HIGH_VOLATILITY',
+    regime: MarketRegimeValue,
     indicators: IndicatorSnapshot
   ): void {
     const trade = this.db.getTrade(dealId);

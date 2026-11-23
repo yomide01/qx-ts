@@ -1,18 +1,40 @@
-import { chromium, BrowserContext, Page } from 'playwright';
-import { spawn } from 'child_process';
+import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { spawn, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+import { buildAlertSpawnArgs } from '../ui/sound.js';
 
 dotenv.config();
 
-const config = {
-  qxUrl: process.env.QX_URL || 'https://quotex.com/en/demo-trade',
-  userDataDir: path.resolve(process.cwd(), process.env.USER_DATA_DIR || './qx_user_profile'),
-  chromePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  headless: process.env.HEADLESS === 'true',
-  remoteDebugPort: process.env.CHROME_REMOTE_DEBUG ? Number(process.env.CHROME_REMOTE_DEBUG) : null,
-};
+export function parseCloseChromeOnExit(raw: string | undefined): boolean {
+  if (raw === undefined || raw.trim() === '') return true;
+  const v = raw.trim().toLowerCase();
+  return v !== 'false' && v !== '0' && v !== 'no';
+}
+
+export function buildChromeLaunchArgs(port: number, userDataDir: string, startUrl: string): string[] {
+  return [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--start-maximized',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--autoplay-policy=no-user-gesture-required',
+    startUrl,
+  ];
+}
+
+function getConfig() {
+  return {
+    qxUrl: process.env.QX_URL || 'https://quotex.com/en/demo-trade',
+    userDataDir: path.resolve(process.cwd(), process.env.USER_DATA_DIR || './qx_user_profile'),
+    chromePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    headless: process.env.HEADLESS === 'true',
+    remoteDebugPort: process.env.CHROME_REMOTE_DEBUG ? Number(process.env.CHROME_REMOTE_DEBUG) : 9222,
+    closeChromeOnExit: parseCloseChromeOnExit(process.env.CLOSE_CHROME_ON_EXIT),
+  };
+}
 
 export interface SessionStatus {
   isAuthenticated: boolean;
@@ -22,15 +44,23 @@ export interface SessionStatus {
   pageTitle?: string;
 }
 
+export interface BrowserSession {
+  context: BrowserContext;
+  page: Page;
+  isExternalChrome: boolean;
+  closeChromeOnExit: boolean;
+  closeBrowser: () => Promise<void>;
+}
+
 /**
- * Inspects the actual live page DOM and title (not just the URL string)
- * to determine whether the browser is on a Cloudflare verification challenge,
- * a Quotex login screen, or inside the authenticated trading room.
+ * Inspects the actual live page DOM and title to determine whether the browser
+ * is on a Cloudflare verification challenge, a Quotex login screen, or inside
+ * the authenticated trading room.
  */
 export async function inspectPageStatus(page: Page): Promise<SessionStatus> {
   const currentUrl = page.url();
   try {
-    const info = await page.evaluate(`(() => {
+    const info = (await page.evaluate(`(() => {
       const title = document.title || '';
       const bodyText = document.body?.innerText || '';
       const url = window.location.href;
@@ -50,7 +80,7 @@ export async function inspectPageStatus(page: Page): Promise<SessionStatus> {
         (!!document.querySelector('input[type="password"], input[name="email"]') && !hasChartCanvas);
 
       return { title, isCf, hasChartCanvas, hasTradingUI, hasLoginForm };
-    })()`) as {
+    })()`)) as {
       title: string;
       isCf: boolean;
       hasChartCanvas: boolean;
@@ -73,10 +103,6 @@ export async function inspectPageStatus(page: Page): Promise<SessionStatus> {
   }
 }
 
-/**
- * Removes stale Chrome lockfiles left behind if Chrome previously crashed or was force-closed.
- * This prevents the "Failed to create a ProcessSingleton / Lock file cannot be created" error.
- */
 function cleanStaleProfileLocks(userDataDir: string): void {
   const locks = ['lockfile', 'SingletonLock', 'SingletonSocket', 'SingletonCookie'];
   for (const file of locks) {
@@ -85,23 +111,69 @@ function cleanStaleProfileLocks(userDataDir: string): void {
       try {
         fs.unlinkSync(fullPath);
       } catch {
-        // Ignored if file is actively held
+        // Ignored if actively held
       }
     }
   }
 }
 
 /**
- * Attempts to connect to an already-running visible Chrome instance on the remote debug port.
+ * Spawns a zero-CPU kernel WaitForExit watcher on Windows so that even if the user
+ * closes the terminal window via the red X button (hard-killing node.exe before async
+ * cleanup runs), ONLY the dedicated bot Chrome profile (`qx_user_profile`) closes cleanly.
+ * Never touches the user's personal Chrome profile.
  */
+function startWindowsChromeExitGuard(nodePid: number, userDataDir: string): ChildProcess | null {
+  if (process.platform !== 'win32') return null;
+  const escapedDir = userDataDir.replace(/'/g, "''");
+  const script = [
+    `try {`,
+    `  $parent = [System.Diagnostics.Process]::GetProcessById(${nodePid})`,
+    `  $parent.WaitForExit()`,
+    `} catch {}`,
+    `Start-Sleep -Milliseconds 400`,
+    `try {`,
+    `  $target = '${escapedDir}'`,
+    `  $procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {`,
+    `    $_.CommandLine -and $_.CommandLine.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine -notmatch '--type='`,
+    `  }`,
+    `  foreach ($p in $procs) {`,
+    `    try {`,
+    `      $gp = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue`,
+    `      if ($gp) {`,
+    `        [void]$gp.CloseMainWindow()`,
+    `        if (-not $gp.WaitForExit(3500)) {`,
+    `          Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue`,
+    `        }`,
+    `      }`,
+    `    } catch {}`,
+    `  }`,
+    `} catch {}`,
+  ].join('\n');
+
+  try {
+    const guard = spawn('powershell.exe', buildAlertSpawnArgs(script), {
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+    });
+    guard.on('error', () => {});
+    guard.unref();
+    return guard;
+  } catch {
+    return null;
+  }
+}
+
 async function tryConnectToExistingChrome(
   port: number,
+  qxUrl: string,
   onPageCreated?: (page: Page) => Promise<void>
-): Promise<{ context: BrowserContext; page: Page; isExternalChrome: boolean } | null> {
+): Promise<{ browser: Browser; context: BrowserContext; page: Page } | null> {
   const endpoints = [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
   for (const endpoint of endpoints) {
     try {
-      const browser = await chromium.connectOverCDP(endpoint, { timeout: 3000 });
+      const browser = await chromium.connectOverCDP(endpoint, { timeout: 2500 });
       const contexts = browser.contexts();
       const context = contexts[0];
       if (!context) continue;
@@ -112,16 +184,15 @@ async function tryConnectToExistingChrome(
         page = pages[0] ?? (await context.newPage());
       }
 
-      console.log(`[Browser] ✅ Attached to visible Chrome window (${endpoint}): ${page.url()}`);
+      console.log(`[Browser] Attached to dedicated Chrome window (${endpoint}): ${page.url()}`);
       if (onPageCreated) {
         await onPageCreated(page);
       }
 
-      // If the tab hasn't navigated to Quotex yet, navigate it now
       if (!page.url().includes('quotex.com') && !page.url().includes('qxbroker.com')) {
-        console.log(`[Browser] Navigating visible Chrome tab to ${config.qxUrl}...`);
+        console.log(`[Browser] Navigating Chrome tab to ${qxUrl}...`);
         try {
-          await page.goto(config.qxUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
+          await page.goto(qxUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
         } catch {}
       }
 
@@ -129,7 +200,7 @@ async function tryConnectToExistingChrome(
         await page.bringToFront();
       } catch {}
 
-      return { context, page, isExternalChrome: true };
+      return { browser, context, page };
     } catch {
       // Try next endpoint
     }
@@ -138,54 +209,69 @@ async function tryConnectToExistingChrome(
 }
 
 /**
- * Launches or attaches to a dedicated, visible Google Chrome window with the saved Quotex trading profile.
+ * Attaches to or automatically launches a dedicated, visible Google Chrome window using
+ * `./qx_user_profile` (completely isolated from your personal Chrome) on CDP port 9222.
+ *
+ * When `CLOSE_CHROME_ON_EXIT=true` (default), closing the terminal (via Ctrl+C or the X button)
+ * automatically closes the dedicated bot Chrome window cleanly.
  */
 export async function launchBrowserSession(
   onPageCreated?: (page: Page) => Promise<void>
-): Promise<{
-  context: BrowserContext;
-  page: Page;
-  isExternalChrome?: boolean;
-}> {
+): Promise<BrowserSession> {
+  const config = getConfig();
+
   console.log('======================================================');
   console.log('   QX Persistent Browser Harness — Dedicated Chrome   ');
   console.log('======================================================');
-  console.log(`[Browser] Profile Directory: ${config.userDataDir}`);
-  console.log(`[Browser] Chrome Executable: ${config.chromePath}`);
-  console.log(`[Browser] Quotex URL       : ${config.qxUrl}`);
-  console.log(`[Browser] Headless Mode    : ${config.headless}`);
+  console.log(`[Browser] Profile Directory : ${config.userDataDir}`);
+  console.log(`[Browser] Chrome Executable : ${config.chromePath}`);
+  console.log(`[Browser] Quotex URL        : ${config.qxUrl}`);
+  console.log(`[Browser] Auto-Close Chrome : ${config.closeChromeOnExit ? 'YES (closes with terminal)' : 'NO (stays open)'}`);
 
-  // If remote debug port is configured (default 9222), attach to the user's visible Chrome on port 9222.
-  // Never spawn a hidden background Chrome from a non-interactive shell!
+  if (!fs.existsSync(config.userDataDir)) {
+    fs.mkdirSync(config.userDataDir, { recursive: true });
+  }
+
   const debugPort = config.remoteDebugPort || 9222;
-  console.log(`[Browser] Checking for visible Chrome on port ${debugPort}...`);
-  let existing = await tryConnectToExistingChrome(debugPort, onPageCreated);
+  console.log(`[Browser] Checking for dedicated Chrome on port ${debugPort}...`);
+  let connected = await tryConnectToExistingChrome(debugPort, config.qxUrl, onPageCreated);
+  let spawnedChromePid: number | null = null;
 
-  if (!existing) {
+  if (!connected && fs.existsSync(config.chromePath)) {
     cleanStaleProfileLocks(config.userDataDir);
-    console.log(
-      `[Browser] Waiting for visible Chrome on port ${debugPort} (double-click OPEN_QUOTEX_CHROME.bat or START_QX_BOT.bat)...`
-    );
-    for (let attempt = 0; attempt < 120; attempt++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      existing = await tryConnectToExistingChrome(debugPort, onPageCreated);
-      if (existing) break;
+    console.log(`[Browser] Launching dedicated Chrome window on port ${debugPort}...`);
+    const chromeArgs = buildChromeLaunchArgs(debugPort, config.userDataDir, config.qxUrl);
+    const chromeProc = spawn(config.chromePath, chromeArgs, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+    });
+    chromeProc.on('error', () => {});
+    chromeProc.unref();
+    spawnedChromePid = chromeProc.pid ?? null;
+
+    // Wait up to 20s for Chrome's CDP port to come online
+    for (let attempt = 0; attempt < 25; attempt++) {
+      await new Promise((r) => setTimeout(r, 800));
+      connected = await tryConnectToExistingChrome(debugPort, config.qxUrl, onPageCreated);
+      if (connected) break;
     }
   }
 
-  if (existing) {
-    // Wait for Quotex's React app splash screen (.loading) to mount the trading chart or login form
-    await existing.page
+  if (connected) {
+    const { browser, context, page } = connected;
+
+    await page
       .waitForSelector('canvas, .chart-container, .OmOPV, input[type="password"], #challenge-running', {
         timeout: 15000,
       })
       .catch(() => {});
-    await existing.page.waitForTimeout(1200);
+    await page.waitForTimeout(1200);
 
-    const status = await inspectPageStatus(existing.page);
+    const status = await inspectPageStatus(page);
     if (status.isCloudflareBlocked) {
       console.log('\n------------------------------------------------------');
-      console.log('>>> [CLOUDFLARE VERIFICATION REQUIRED] Complete the security check in your visible Chrome window.');
+      console.log('>>> [CLOUDFLARE VERIFICATION REQUIRED] Complete the security check in Chrome.');
       console.log(`>>> Current URL: ${status.currentUrl}`);
       console.log('------------------------------------------------------\n');
     } else if (status.isAuthenticated) {
@@ -193,43 +279,70 @@ export async function launchBrowserSession(
       console.log(`>>> Current URL: ${status.currentUrl}\n`);
     } else {
       console.log('\n------------------------------------------------------');
-      console.log('>>> [ACTION REQUIRED] Please log into your Quotex DEMO account in the visible Chrome window.');
+      console.log('>>> [ACTION REQUIRED] Please log into your Quotex account in Chrome.');
       console.log(`>>> Current URL: ${status.currentUrl}`);
       console.log('------------------------------------------------------\n');
     }
-    return existing;
+
+    const exitGuard = config.closeChromeOnExit
+      ? startWindowsChromeExitGuard(process.pid, config.userDataDir)
+      : null;
+
+    let closedOnce = false;
+    const closeBrowser = async () => {
+      if (closedOnce) return;
+      closedOnce = true;
+
+      if (!config.closeChromeOnExit) {
+        return;
+      }
+
+      try {
+        const cdp = await browser.newBrowserCDPSession();
+        await cdp.send('Browser.close');
+      } catch {
+        // Fallback: terminate only our spawned Chrome PID if CDP Browser.close failed
+        if (spawnedChromePid && process.platform === 'win32') {
+          try {
+            spawn('taskkill', ['/PID', String(spawnedChromePid), '/T', '/F'], {
+              windowsHide: true,
+              stdio: 'ignore',
+            });
+          } catch {}
+        }
+      }
+
+      if (exitGuard?.pid) {
+        try {
+          process.kill(exitGuard.pid);
+        } catch {}
+      }
+    };
+
+    return {
+      context,
+      page,
+      isExternalChrome: true,
+      closeChromeOnExit: config.closeChromeOnExit,
+      closeBrowser,
+    };
   }
+
+  // Fallback: Playwright persistent context if system Chrome executable was not found
   console.log('[Browser] Falling back to Playwright persistent context...');
+  cleanStaleProfileLocks(config.userDataDir);
 
-  // 1. Ensure profile directory exists and clean stale lock files
-  if (!fs.existsSync(config.userDataDir)) {
-    fs.mkdirSync(config.userDataDir, { recursive: true });
-  } else {
-    cleanStaleProfileLocks(config.userDataDir);
-  }
-
-  // 2. Launch dedicated visible Google Chrome
-  console.log('[Browser] Opening dedicated Google Chrome window...');
   const context = await chromium.launchPersistentContext(config.userDataDir, {
     executablePath: fs.existsSync(config.chromePath) ? config.chromePath : undefined,
     headless: config.headless,
-    viewport: null, // Natural window scaling to fit screen
+    viewport: null,
     ignoreDefaultArgs: ['--enable-automation'],
-    // Playwright switches Chrome's security sandbox OFF unless told otherwise, which is what
-    // causes Chrome's "unsupported command-line flag: --no-sandbox" warning bar.
     chromiumSandbox: true,
-    args: [
-      '--start-maximized',
-      '--window-position=0,0',
-      '--no-default-browser-check',
-      '--no-first-run',
-    ],
+    args: ['--start-maximized', '--window-position=0,0', '--no-default-browser-check', '--no-first-run'],
   });
 
-  // Inject stealth script to clean navigator.webdriver without unsupported command-line flags
   await context.addInitScript(() => {
     try {
-      // Overwrite webdriver getter on Navigator prototype
       Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
         get: () => undefined,
       });
@@ -239,15 +352,12 @@ export async function launchBrowserSession(
   const pages = context.pages();
   const page = pages.length > 0 ? pages[0] : await context.newPage();
 
-  // Attach interceptors/listeners BEFORE page navigates
   if (onPageCreated) {
     await onPageCreated(page);
   }
 
-  console.log('[Browser] Navigating directly to Quotex...');
   try {
     await page.goto(config.qxUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
-    // Wait for Quotex's React app splash screen (.loading) to mount the trading chart or login form
     await page
       .waitForSelector('canvas, .chart-container, .OmOPV, input[type="password"], #challenge-running', {
         timeout: 15000,
@@ -259,42 +369,25 @@ export async function launchBrowserSession(
     console.warn('[Browser Warning] Navigation notice:', (err as Error).message);
   }
 
-  const status = await inspectPageStatus(page);
-  if (status.isCloudflareBlocked) {
-    console.log('\n------------------------------------------------------');
-    console.log('>>> [CLOUDFLARE VERIFICATION REQUIRED] Complete the security check in the Chrome window.');
-    console.log(`>>> Current URL: ${page.url()}`);
-    console.log('------------------------------------------------------\n');
-  } else if (status.isAuthenticated) {
-    console.log(`\n>>> [STATUS: LOGGED IN] Active trading session restored!`);
-    console.log(`>>> Current URL: ${page.url()}\n`);
-  } else {
-    console.log('\n------------------------------------------------------');
-    console.log('>>> [ACTION REQUIRED] Please log in manually in the Chrome window.');
-    console.log('>>> Your session and cookies will be saved in ./qx_user_profile.');
-    console.log('------------------------------------------------------\n');
-  }
-
-  // Continuous trading room navigation watcher
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) {
-      const updatedUrl = frame.url();
-      if ((updatedUrl.includes('/trade') || updatedUrl.includes('/demo-trade')) && !updatedUrl.includes('__cf_chl')) {
-        console.log(`[Session Watcher] Trading Room URL loaded: ${updatedUrl}`);
-      }
-    }
-  });
-
-  return { context, page, isExternalChrome: false };
+  return {
+    context,
+    page,
+    isExternalChrome: false,
+    closeChromeOnExit: config.closeChromeOnExit,
+    closeBrowser: async () => {
+      await context.close().catch(() => {});
+    },
+  };
 }
 
 /**
- * Checks if the current page URL represents an authenticated trading room
+ * Checks if the current page URL represents an authenticated trading room.
  */
 export function checkSessionStatus(url: string): SessionStatus {
-  const isTradeRoom = url.includes('/trade') || url.includes('/demo-trade');
+  const isAuth =
+    (url.includes('/trade') || url.includes('/demo-trade')) && !url.includes('/sign-in') && !url.includes('__cf_chl');
   return {
-    isAuthenticated: isTradeRoom,
+    isAuthenticated: isAuth,
     currentUrl: url,
   };
 }

@@ -43,6 +43,8 @@ export interface TradeDeal {
   openPrice: number;
   closePrice?: number;
   profit?: number;
+  /** Exact payout % attached by Quotex to the deal itself (e.g. percentProfit: 90). */
+  payoutPercent?: number;
   status: 'open' | 'won' | 'lost' | 'draw';
   /** Only set when Quotex itself tells us which account the deal belongs to. */
   isDemo?: boolean;

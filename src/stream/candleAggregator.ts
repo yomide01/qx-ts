@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { Tick, Candle } from './types.js';
 import { QxWsSniffer } from './wsSniffer.js';
 import { normalizeAsset } from './assets.js';
+import { TradingJournalDB } from '../journal/database.js';
 
 export interface CandleEvents {
   candleUpdate: (candle: Candle) => void;
@@ -12,12 +13,18 @@ export class CandleAggregator extends EventEmitter {
   // Key format: `${asset}_${timeframeSeconds}`
   private activeCandles: Map<string, Candle> = new Map();
   private candleHistory: Map<string, Candle[]> = new Map();
+  private loadedFromDb: Set<string> = new Set();
   private supportedTimeframes: number[] = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
-  private maxHistorySize: number = 250;
-  private lastSeededLog: Map<string, number> = new Map();
+  private maxHistorySize: number = 5000;
+  private db: TradingJournalDB | null = null;
 
-  constructor(private sniffer: QxWsSniffer) {
+  constructor(
+    private sniffer: QxWsSniffer,
+    db?: TradingJournalDB
+  ) {
     super();
+    this.db = db ?? null;
+
     this.sniffer.on('tick', (tick: Tick) => this.onTick(tick));
     this.sniffer.on('history', (h: { asset: string; period: number; ticks: Tick[]; candles?: Candle[] }) => {
       if (h.candles && h.candles.length > 0) {
@@ -34,30 +41,99 @@ export class CandleAggregator extends EventEmitter {
     );
   }
 
+  private ensureLoadedFromDb(cleanAsset: string, timeframeSeconds: number): void {
+    if (!this.db) return;
+    const key = `${cleanAsset}_${timeframeSeconds}`;
+    if (this.loadedFromDb.has(key)) return;
+    this.loadedFromDb.add(key);
+
+    try {
+      const persisted = this.db.getCandles(cleanAsset, timeframeSeconds, this.maxHistorySize);
+      if (persisted.length > 0) {
+        this.mergeClosedCandles(key, persisted, false);
+      }
+    } catch {
+      // Safe fallback if DB is closed or read-only
+    }
+  }
+
+  /**
+   * Merges incoming closed candles into the existing series by `openTime` so live chart
+   * refreshes (~200 bars) NEVER wipe out earlier accumulated or SQLite-persisted history.
+   */
+  private mergeClosedCandles(key: string, incoming: Candle[], persist: boolean = true): Candle[] {
+    const existing = this.candleHistory.get(key) || [];
+    const byOpenTime = new Map<number, Candle>();
+
+    for (const c of existing) {
+      byOpenTime.set(c.openTime, c);
+    }
+
+    const newlyAddedOrUpdated: Candle[] = [];
+    for (const c of incoming) {
+      if (c.isClosed === false) continue;
+      const prev = byOpenTime.get(c.openTime);
+      if (
+        !prev ||
+        prev.open !== c.open ||
+        prev.high !== c.high ||
+        prev.low !== c.low ||
+        prev.close !== c.close
+      ) {
+        const merged: Candle = prev
+          ? {
+              ...c,
+              high: Math.max(prev.high, c.high),
+              low: Math.min(prev.low, c.low),
+              isClosed: true,
+            }
+          : { ...c, isClosed: true };
+        byOpenTime.set(c.openTime, merged);
+        newlyAddedOrUpdated.push(merged);
+      }
+    }
+
+    const sorted = Array.from(byOpenTime.values())
+      .sort((a, b) => a.openTime - b.openTime)
+      .slice(-this.maxHistorySize);
+
+    this.candleHistory.set(key, sorted);
+
+    if (persist && this.db && newlyAddedOrUpdated.length > 0) {
+      try {
+        this.db.saveCandles(newlyAddedOrUpdated);
+      } catch {
+        // Ignore persistence errors during shutdown
+      }
+    }
+
+    return sorted;
+  }
+
   private onTick(tick: Tick): void {
     const tickTimeMs = tick.time > 1e11 ? tick.time : tick.time * 1000;
+    const cleanAsset = normalizeAsset(tick.asset);
 
     for (const tf of this.supportedTimeframes) {
       const tfMs = tf * 1000;
       const candleOpenTime = Math.floor(tickTimeMs / tfMs) * tfMs;
-      const key = `${tick.asset}_${tf}`;
+      const key = `${cleanAsset}_${tf}`;
 
       let current = this.activeCandles.get(key);
       if (current && candleOpenTime < current.openTime) {
-        continue; // Ignore out-of-order / slightly older fallback timestamps
+        continue;
       }
 
       if (!current || current.openTime !== candleOpenTime) {
-        // If there was an existing open candle, close it
         if (current) {
           current.isClosed = true;
-          this.storeClosedCandle(key, current);
+          this.ensureLoadedFromDb(cleanAsset, tf);
+          this.mergeClosedCandles(key, [current], tf >= 60);
           this.emit('candleClosed', current);
         }
 
-        // Start new candle
         current = {
-          asset: tick.asset,
+          asset: cleanAsset,
           timeframe: tf,
           openTime: candleOpenTime,
           open: tick.price,
@@ -68,7 +144,6 @@ export class CandleAggregator extends EventEmitter {
         };
         this.activeCandles.set(key, current);
       } else {
-        // Update current candle
         current.high = Math.max(current.high, tick.price);
         current.low = Math.min(current.low, tick.price);
         current.close = tick.price;
@@ -78,35 +153,20 @@ export class CandleAggregator extends EventEmitter {
     }
   }
 
-  private storeClosedCandle(key: string, candle: Candle): void {
-    let history = this.candleHistory.get(key);
-    if (!history) {
-      history = [];
-      this.candleHistory.set(key, history);
-    }
-
-    history.push({ ...candle });
-    if (history.length > this.maxHistorySize) {
-      history.shift();
-    }
-  }
-
   /**
-   * Seeds historical candles from an array of past ticks (e.g. from Quotex history/list/v2).
-   * Aggregates them into proper M1 and M5 candles so indicators (EMA, RSI, BB) are immediately ready!
+   * Seeds historical candles from an array of past ticks and merges with existing history.
    */
   public seedHistory(asset: string, ticks: Tick[]): void {
     if (!ticks || ticks.length === 0) return;
     const cleanAsset = normalizeAsset(asset);
-
-    // Sort ticks chronologically
     const sorted = [...ticks].sort((a, b) => a.time - b.time);
 
     for (const tf of this.supportedTimeframes) {
       const tfMs = tf * 1000;
       const key = `${cleanAsset}_${tf}`;
-      const candlesMap: Map<number, Candle> = new Map();
+      this.ensureLoadedFromDb(cleanAsset, tf);
 
+      const candlesMap: Map<number, Candle> = new Map();
       for (const t of sorted) {
         const tickTimeMs = t.time > 1e11 ? t.time : t.time * 1000;
         const candleOpenTime = Math.floor(tickTimeMs / tfMs) * tfMs;
@@ -131,22 +191,24 @@ export class CandleAggregator extends EventEmitter {
         }
       }
 
-      // Convert map to chronological array
       const candles = Array.from(candlesMap.values()).sort((a, b) => a.openTime - b.openTime);
       if (candles.length > 0) {
-        // The very last candle in the history is the currently forming candle
         const active = candles.pop()!;
         active.isClosed = false;
-        this.activeCandles.set(key, active);
-        this.candleHistory.set(key, candles.slice(-this.maxHistorySize));
+        const prevActive = this.activeCandles.get(key);
+        if (!prevActive || active.openTime >= prevActive.openTime) {
+          this.activeCandles.set(key, active);
+        }
+        if (candles.length > 0) {
+          this.mergeClosedCandles(key, candles, tf >= 60);
+        }
       }
     }
   }
 
   /**
-   * Seeds historical candles directly from Quotex's on-screen chart historyPoints
-   * (chartSettings.chartById.graph.historyPoints), which contains both 4-point compressed
-   * historical candles and live ticks for the currently displayed asset and timeframe.
+   * Seeds historical candles from Quotex's on-screen chart historyPoints (4-point compressed OHLC + live ticks),
+   * merging cleanly with previously collected & SQLite-persisted candles.
    */
   public seedFromChartHistory(
     asset: string,
@@ -157,6 +219,7 @@ export class CandleAggregator extends EventEmitter {
     const cleanAsset = normalizeAsset(asset);
     const tfMs = timeframeSeconds * 1000;
     const key = `${cleanAsset}_${timeframeSeconds}`;
+    this.ensureLoadedFromDb(cleanAsset, timeframeSeconds);
 
     const sorted = [...points]
       .filter((p) => typeof p.value === 'number' && !isNaN(p.value) && typeof p.time === 'number' && !isNaN(p.time))
@@ -191,10 +254,13 @@ export class CandleAggregator extends EventEmitter {
     if (candles.length > 0) {
       const active = candles.pop()!;
       active.isClosed = false;
-      this.activeCandles.set(key, active);
-
-      const closedSlice = candles.slice(-this.maxHistorySize);
-      this.candleHistory.set(key, closedSlice);
+      const prevActive = this.activeCandles.get(key);
+      if (!prevActive || active.openTime >= prevActive.openTime) {
+        this.activeCandles.set(key, active);
+      }
+      if (candles.length > 0) {
+        this.mergeClosedCandles(key, candles, true);
+      }
     }
   }
 
@@ -205,9 +271,11 @@ export class CandleAggregator extends EventEmitter {
     const cleanAsset = normalizeAsset(asset);
     const tf = period || 60;
     const key = `${cleanAsset}_${tf}`;
+    this.ensureLoadedFromDb(cleanAsset, tf);
+
     const sorted = [...rawCandles].sort((a, b) => a.openTime - b.openTime);
     if (sorted.length > 0) {
-      this.candleHistory.set(key, sorted.slice(-this.maxHistorySize));
+      this.mergeClosedCandles(key, sorted, true);
     }
     if (recentTicks && recentTicks.length > 0) {
       this.seedHistory(cleanAsset, recentTicks);
@@ -215,18 +283,20 @@ export class CandleAggregator extends EventEmitter {
   }
 
   /**
-   * Returns closed candles for an asset and timeframe (chronological order).
-   * If target timeframe has fewer than 8 candles, attempts to synthesize from sub-period (e.g. M1 -> M5)
-   * using aligned timestamp boundaries.
+   * Returns closed candles for an asset and timeframe in chronological order.
    */
   public getHistory(asset: string, timeframeSeconds: number): Candle[] {
-    const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
+    const cleanAsset = normalizeAsset(asset);
+    const key = `${cleanAsset}_${timeframeSeconds}`;
+    this.ensureLoadedFromDb(cleanAsset, timeframeSeconds);
+
     const direct = this.candleHistory.get(key);
     if (direct && direct.length >= 8) return direct;
 
     // Synthesize higher timeframe candles from M1 (60s) aligned by floor timestamp
     if (timeframeSeconds > 60 && timeframeSeconds % 60 === 0) {
-      const m1Key = `${normalizeAsset(asset)}_60`;
+      this.ensureLoadedFromDb(cleanAsset, 60);
+      const m1Key = `${cleanAsset}_60`;
       const m1Candles = this.candleHistory.get(m1Key) || [];
       const tfMs = timeframeSeconds * 1000;
       const ratio = timeframeSeconds / 60;
@@ -264,9 +334,6 @@ export class CandleAggregator extends EventEmitter {
     return direct || [];
   }
 
-  /**
-   * Returns the currently active (forming) candle
-   */
   public getCurrentCandle(asset: string, timeframeSeconds: number): Candle | undefined {
     const key = `${normalizeAsset(asset)}_${timeframeSeconds}`;
     return this.activeCandles.get(key);

@@ -407,10 +407,32 @@ export class QxWsParser {
       isCall = rawDir === 'call' || rawDir === 'up' || rawDir === '1';
     }
 
-    const closeTs = Number(data.close_time ?? data.closeTimestamp ?? data.closeTime ?? 0);
-    const openTs = Number(data.open_time ?? data.openTimestamp ?? data.openTime ?? Date.now());
-    const rawClosePrice = data.close_price !== undefined ? Number(data.close_price) : data.closePrice !== undefined ? Number(data.closePrice) : undefined;
+    const parseNumericTs = (candidates: unknown[], fallback: number): number => {
+      for (const raw of candidates) {
+        if (raw === undefined || raw === null || raw === '') continue;
+        if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+        if (typeof raw === 'string') {
+          const asNum = Number(raw);
+          if (Number.isFinite(asNum) && asNum > 0) return asNum;
+          const parsedDate = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z');
+          if (Number.isFinite(parsedDate) && parsedDate > 0) return parsedDate;
+        }
+      }
+      return fallback;
+    };
+
+    const closeTs = parseNumericTs([data.closeTimestamp, data.close_time, data.closeTime], 0);
+    const openTs = parseNumericTs([data.openTimestamp, data.open_time, data.openTime], Date.now());
+    const rawClosePrice =
+      data.close_price !== undefined
+        ? Number(data.close_price)
+        : data.closePrice !== undefined
+        ? Number(data.closePrice)
+        : undefined;
     const closePrice = rawClosePrice !== undefined && rawClosePrice > 0 ? rawClosePrice : undefined;
+    const rawPercentProfit =
+      data.percentProfit ?? data.percent_profit ?? data.profit_percent ?? data.payoutPercent;
+    const payoutPercent = QxWsParser.toPercent(rawPercentProfit) ?? undefined;
 
     // A newly opened Quotex binary option always carries a future closeTimestamp (scheduled expiry),
     // a potential profit, and often initializes closePrice to the current price while ticking.
@@ -443,6 +465,7 @@ export class QxWsParser {
       openPrice: Number(data.open_price ?? data.openPrice ?? 0),
       closePrice,
       profit: data.profit !== undefined ? Number(data.profit) : undefined,
+      payoutPercent,
       isDemo: QxWsParser.readDemoFlag(data) ?? undefined,
       status,
     };

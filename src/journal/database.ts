@@ -2,20 +2,37 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import fs from 'fs';
 import { TradeRecord } from './types.js';
+import { Candle } from '../stream/types.js';
+import { normalizeAsset } from '../stream/assets.js';
+
+export interface CandleSeriesSummary {
+  asset: string;
+  timeframe: number;
+  count: number;
+  firstTime: number;
+  lastTime: number;
+}
 
 export class TradingJournalDB {
   private db: DatabaseSync;
 
   constructor(dbPath?: string) {
     const finalPath = dbPath || path.resolve(process.cwd(), 'data', 'qx_trading.db');
-    const dir = path.dirname(finalPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (finalPath !== ':memory:') {
+      const dir = path.dirname(finalPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
     }
 
     this.db = new DatabaseSync(finalPath);
     this.initSchema();
     this.repairHistoricalAnomalies();
+  }
+
+  public static toEpochMs(ts: number): number {
+    if (!Number.isFinite(ts) || ts <= 0) return 0;
+    return ts < 1e11 ? Math.round(ts * 1000) : Math.round(ts);
   }
 
   public static sanitizePayoutPercent(payoutPercent: number, stakeAmount?: number): number {
@@ -33,7 +50,6 @@ export class TradingJournalDB {
       return fallback;
     }
     const diff = closeTime - openTime;
-    // If timestamps are in milliseconds (> 1e11), diff is in ms; if in seconds (< 1e11), diff is already in seconds.
     const isMs = openTime > 1e11 || closeTime > 1e11 || diff > 86400 * 2;
     const sec = isMs ? Math.round(diff / 1000) : Math.round(diff);
     return sec > 0 ? sec : fallback;
@@ -67,6 +83,19 @@ export class TradingJournalDB {
       CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);
       CREATE INDEX IF NOT EXISTS idx_trades_open_time ON trades (open_time);
       CREATE INDEX IF NOT EXISTS idx_trades_is_otc ON trades (is_otc);
+
+      CREATE TABLE IF NOT EXISTS candles (
+        asset TEXT NOT NULL,
+        timeframe INTEGER NOT NULL,
+        open_time INTEGER NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        PRIMARY KEY (asset, timeframe, open_time)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles (asset, timeframe, open_time);
     `);
   }
 
@@ -187,35 +216,144 @@ export class TradingJournalDB {
     stmt.run(closePrice, profitLoss, status, dealId);
   }
 
-  /**
-   * Retrieves a trade by deal ID.
-   */
   public getTrade(id: string): TradeRecord | null {
     const stmt = this.db.prepare(`SELECT * FROM trades WHERE id = ?`);
     const row = stmt.get(id) as any;
     return row ? this.mapRowToTrade(row) : null;
   }
 
-  /**
-   * Retrieves all trades matching an optional status or limit.
-   */
-  public getAllTrades(limit: number = 500): TradeRecord[] {
+  public getAllTrades(limit: number = 2000): TradeRecord[] {
     const stmt = this.db.prepare(`
       SELECT * FROM trades
-      ORDER BY open_time DESC
+      ORDER BY CASE WHEN open_time < 100000000000 THEN open_time * 1000 ELSE open_time END DESC
       LIMIT ?
     `);
     const rows = stmt.all(limit) as any[];
     return rows.map((r) => this.mapRowToTrade(r));
   }
 
-  /**
-   * Retrieves currently open trades.
-   */
   public getOpenTrades(): TradeRecord[] {
     const stmt = this.db.prepare(`SELECT * FROM trades WHERE status = 'OPEN'`);
     const rows = stmt.all() as any[];
     return rows.map((r) => this.mapRowToTrade(r));
+  }
+
+  /**
+   * Returns net PnL and settled trade count for the current local calendar day
+   * for either DEMO or LIVE accounts (used to enforce persistent daily loss limits across restarts).
+   */
+  public getTodayNetPnL(isDemo: boolean, nowMs: number = Date.now()): { netPnL: number; tradeCount: number } {
+    const startOfDay = new Date(nowMs);
+    startOfDay.setHours(0, 0, 0, 0);
+    const startMs = startOfDay.getTime();
+    const startSec = Math.floor(startMs / 1000);
+
+    const stmt = this.db.prepare(`
+      SELECT COALESCE(SUM(profit_loss), 0) AS net_pnl, COUNT(*) AS cnt
+      FROM trades
+      WHERE is_demo = ?
+        AND status IN ('WON', 'LOST', 'DRAW')
+        AND (
+          (open_time < 100000000000 AND open_time >= ?)
+          OR (open_time >= 100000000000 AND open_time >= ?)
+        )
+    `);
+    const row = stmt.get(isDemo ? 1 : 0, startSec, startMs) as any;
+    return {
+      netPnL: Number(row?.net_pnl ?? 0),
+      tradeCount: Number(row?.cnt ?? 0),
+    };
+  }
+
+  // ───────────────────────── CANDLE ARCHIVE (for walk-forward & offline backtesting) ─────────────────────────
+
+  /**
+   * Persists closed candles in a single SQLite transaction (upsert by asset, timeframe, open_time).
+   */
+  public saveCandles(candles: Candle[]): number {
+    if (!candles || candles.length === 0) return 0;
+    const valid = candles.filter(
+      (c) =>
+        c.isClosed !== false &&
+        c.asset &&
+        c.timeframe > 0 &&
+        c.openTime > 0 &&
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close)
+    );
+    if (valid.length === 0) return 0;
+
+    const stmt = this.db.prepare(`
+      INSERT INTO candles (asset, timeframe, open_time, open, high, low, close)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(asset, timeframe, open_time) DO UPDATE SET
+        open = excluded.open,
+        high = MAX(candles.high, excluded.high),
+        low = MIN(candles.low, excluded.low),
+        close = excluded.close
+    `);
+
+    this.db.exec('BEGIN');
+    try {
+      for (const c of valid) {
+        const normAsset = normalizeAsset(c.asset);
+        const openMs = TradingJournalDB.toEpochMs(c.openTime);
+        stmt.run(normAsset, c.timeframe, openMs, c.open, c.high, c.low, c.close);
+      }
+      this.db.exec('COMMIT');
+      return valid.length;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Loads persisted closed candles in ascending chronological order.
+   */
+  public getCandles(asset: string, timeframe: number, limit: number = 5000): Candle[] {
+    const normAsset = normalizeAsset(asset);
+    const stmt = this.db.prepare(`
+      SELECT asset, timeframe, open_time, open, high, low, close
+      FROM (
+        SELECT asset, timeframe, open_time, open, high, low, close
+        FROM candles
+        WHERE asset = ? AND timeframe = ?
+        ORDER BY open_time DESC
+        LIMIT ?
+      )
+      ORDER BY open_time ASC
+    `);
+    const rows = stmt.all(normAsset, timeframe, limit) as any[];
+    return rows.map((r) => ({
+      asset: r.asset,
+      timeframe: r.timeframe,
+      openTime: r.open_time,
+      open: r.open,
+      high: r.high,
+      low: r.low,
+      close: r.close,
+      isClosed: true,
+    }));
+  }
+
+  public listCandleSeries(): CandleSeriesSummary[] {
+    const stmt = this.db.prepare(`
+      SELECT asset, timeframe, COUNT(*) AS cnt, MIN(open_time) AS first_time, MAX(open_time) AS last_time
+      FROM candles
+      GROUP BY asset, timeframe
+      ORDER BY cnt DESC, asset ASC
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map((r) => ({
+      asset: r.asset,
+      timeframe: r.timeframe,
+      count: Number(r.cnt),
+      firstTime: Number(r.first_time),
+      lastTime: Number(r.last_time),
+    }));
   }
 
   private mapRowToTrade(row: any): TradeRecord {
@@ -237,9 +375,7 @@ export class TradingJournalDB {
       signalConfidence: row.signal_confidence ?? undefined,
       signalReason: row.signal_reason ?? undefined,
       marketRegime: row.market_regime ?? undefined,
-      indicatorsAtEntry: row.indicators_at_entry
-        ? JSON.parse(row.indicators_at_entry)
-        : undefined,
+      indicatorsAtEntry: row.indicators_at_entry ? JSON.parse(row.indicators_at_entry) : undefined,
     };
   }
 
